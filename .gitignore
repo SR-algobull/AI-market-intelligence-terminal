@@ -1,0 +1,7 @@
+.env
+.streamlit/secrets.toml
+node_modules/
+dist/
+.vite/
+__pycache__/
+npm-debug.log*

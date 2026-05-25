@@ -1,0 +1,14 @@
+{
+  "name": "ai-market-intelligence-terminal",
+  "version": "1.0.0",
+  "description": "Portfolio-grade AI market intelligence terminal with NLP sentiment, risk scoring, alerts, and explainability.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "start:live": "node server.js",
+    "test": "node tests/engine.test.js"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}
