@@ -158,7 +158,7 @@ def fetch_alpaca(symbol):
     api_secret = secret("ALPACA_API_SECRET")
     feed = secret("ALPACA_DATA_FEED", "iex")
     if not key or not api_secret:
-        raise RuntimeError("Missing Alpaca secrets")
+        return None, None, "missing-alpaca-secrets"
     headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": api_secret, "accept": "application/json"}
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=70)
@@ -298,6 +298,32 @@ def openai_explanation(symbol, tech, sentiment, risk, confidence, items):
 
 def analyze(symbol):
     candles, volume, provider = fetch_alpaca(symbol)
+    if not candles or not volume:
+        return {
+            "symbol": symbol,
+            "candles": [],
+            "volume": [],
+            "provider": provider,
+            "sentiment": {"label": "Setup Required", "score": 0, "confidence": 0, "topEvents": []},
+            "technicals": {
+                "lastPrice": 0,
+                "rsi": 0,
+                "vwap": 0,
+                "macdHistogram": 0,
+                "trendStrength": 0,
+                "bias": "Setup Required",
+            },
+            "risk": {"score": 0, "level": "Setup Required"},
+            "confidence": 0,
+            "explanation": (
+                "Add Alpaca credentials in Streamlit Cloud Secrets to enable live market data. "
+                "Required keys: ALPACA_API_KEY, ALPACA_API_SECRET, and ALPACA_DATA_FEED."
+            ),
+            "aiMode": "Setup Required",
+            "analyzed": [],
+            "setupError": True,
+        }
+
     text_items = fetch_finnhub_news(symbol) + fetch_stocktwits(symbol)
     analyzed = analyze_text(text_items)
     sentiment = aggregate_sentiment(analyzed)
@@ -337,6 +363,19 @@ if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
 
 analysis = st.session_state.analysis
 st.caption(f"LIVE DATA ({analysis['provider']}) | STOCKTWITS SOCIAL | {analysis['aiMode'].upper()} AI")
+
+if analysis.get("setupError"):
+    st.error("Missing Alpaca credentials in Streamlit Cloud Secrets.")
+    st.code(
+        """ALPACA_API_KEY = "your_alpaca_key"
+ALPACA_API_SECRET = "your_alpaca_secret"
+ALPACA_DATA_FEED = "iex"
+FINNHUB_API_KEY = "your_finnhub_key"
+OPENAI_API_KEY = "your_openai_key"
+OPENAI_MODEL = "gpt-5.2" """,
+        language="toml",
+    )
+    st.stop()
 
 left, right = st.columns([0.9, 1.3])
 with left:
