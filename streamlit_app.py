@@ -111,19 +111,6 @@ DEMO_TEXT = [
     },
 ]
 
-STREAMLIT_SECRETS_TEMPLATE = """ALPACA_API_KEY = "your_alpaca_key"
-ALPACA_API_SECRET = "your_alpaca_secret"
-ALPACA_DATA_FEED = "iex"
-
-FINNHUB_API_KEY = "your_finnhub_key"
-
-OPENAI_API_KEY = "your_openai_key"
-OPENAI_MODEL = "gpt-5.2"
-
-STOCKTWITS_USERNAME = "your_stocktwits_email"
-STOCKTWITS_PASSWORD = "your_stocktwits_password" """
-
-
 def secret(name, default=""):
     try:
         return st.secrets.get(name, os.getenv(name, default))
@@ -408,10 +395,6 @@ def analyze(symbol):
 
 
 st.title("AI Market Intelligence Terminal")
-with st.sidebar.expander("Streamlit Secrets", expanded=False):
-    st.write("Paste this into Streamlit Cloud > Manage app > Settings > Secrets.")
-    st.code(STREAMLIT_SECRETS_TEMPLATE, language="toml")
-
 symbol = st.text_input("Ticker", "NVDA").upper().strip() or "NVDA"
 
 if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
@@ -446,7 +429,7 @@ st.caption(f"LIVE DATA ({analysis['provider']}) | STOCKTWITS SOCIAL | {analysis[
 
 if analysis.get("setupError"):
     st.error(analysis["explanation"])
-    st.code(STREAMLIT_SECRETS_TEMPLATE, language="toml")
+    st.info("Configure deployment secrets in Streamlit Cloud settings, then reboot the app.")
     st.stop()
 
 if analysis.get("providerStatus"):

@@ -50,23 +50,9 @@ StockTwits social data is pulled from the ticker message stream and merged into 
 
 ## Streamlit Cloud Secrets
 
-For Streamlit Cloud, do not commit real credentials to GitHub. Open the deployed app, choose **Manage app -> Settings -> Secrets**, and paste:
+For Streamlit Cloud, do not commit real credentials to GitHub. Add deployment credentials only in **Manage app -> Settings -> Secrets**, then reboot the app.
 
-```toml
-ALPACA_API_KEY = "your_alpaca_key"
-ALPACA_API_SECRET = "your_alpaca_secret"
-ALPACA_DATA_FEED = "iex"
-
-FINNHUB_API_KEY = "your_finnhub_key"
-
-OPENAI_API_KEY = "your_openai_key"
-OPENAI_MODEL = "gpt-5.2"
-
-STOCKTWITS_USERNAME = "your_stocktwits_email"
-STOCKTWITS_PASSWORD = "your_stocktwits_password"
-```
-
-The repository only includes `.env.example` and `.streamlit/secrets.toml.example`. The real `.env` and `.streamlit/secrets.toml` files are ignored by Git.
+The repository includes safe placeholder templates only. The real `.env` and `.streamlit/secrets.toml` files are ignored by Git.
 
 ## Test
 
