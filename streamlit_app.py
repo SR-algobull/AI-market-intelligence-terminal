@@ -399,6 +399,54 @@ def overbought_indicator(tech, volume_view):
     }
 
 
+def key_levels(candles, tech):
+    current = candles[-1]
+    recent_high = max(candles[-20:])
+    recent_low = min(candles[-20:])
+    prior_high = max(candles[-21:-1]) if len(candles) > 21 else max(candles[:-1])
+    prior_low = min(candles[-21:-1]) if len(candles) > 21 else min(candles[:-1])
+    vwap = tech["vwap"]
+    midpoint = (recent_high + recent_low) / 2
+
+    supports = sorted({round(recent_low, 2), round(prior_low, 2), round(vwap, 2), round(midpoint, 2)})
+    resistances = sorted({round(recent_high, 2), round(prior_high, 2), round(vwap, 2), round(midpoint, 2)})
+    support_below = [level for level in supports if level <= current]
+    resistance_above = [level for level in resistances if level >= current]
+    nearest_support = max(support_below) if support_below else min(supports)
+    nearest_resistance = min(resistance_above) if resistance_above else max(resistances)
+    support_distance = ((current - nearest_support) / current) if current else 0
+    resistance_distance = ((nearest_resistance - current) / current) if current else 0
+
+    if current > prior_high * 1.01:
+        status = "Breakout"
+        explanation = "Price is trading above recent resistance, so the setup has a breakout component."
+    elif current < prior_low * 0.99:
+        status = "Breakdown"
+        explanation = "Price is trading below recent support, so downside technical risk is elevated."
+    elif resistance_distance <= 0.015:
+        status = "Near resistance"
+        explanation = "Price is close to overhead resistance, so upside may need stronger volume confirmation."
+    elif support_distance <= 0.015:
+        status = "Near support"
+        explanation = "Price is close to support, so risk/reward may depend on whether that level holds."
+    else:
+        status = "Between levels"
+        explanation = "Price is between major support and resistance, so confirmation from momentum and sentiment matters more."
+
+    return {
+        "status": status,
+        "current": round(current, 2),
+        "nearestSupport": round(nearest_support, 2),
+        "nearestResistance": round(nearest_resistance, 2),
+        "supportDistancePct": round(support_distance * 100, 2),
+        "resistanceDistancePct": round(resistance_distance * 100, 2),
+        "recentHigh": round(recent_high, 2),
+        "recentLow": round(recent_low, 2),
+        "vwap": round(vwap, 2),
+        "explanation": explanation,
+    }
+
+
 def irrationality_gauge(analyzed_items, sentiment, tech, risk, volume_view):
     if not analyzed_items:
         return {
@@ -472,7 +520,7 @@ def risk_score(candles, sentiment):
     return {"score": round(score, 2), "level": "High" if score > 0.68 else "Moderate" if score > 0.42 else "Low"}
 
 
-def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, overbought, confidence, items):
+def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, overbought, levels, confidence, items):
     api_key = secret("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -489,8 +537,9 @@ def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, ove
             f"Volume: {volume['label']} | ratio {volume['ratio']}x | {volume['explanation']}\n"
             f"Market irrationality gauge: {irrationality['level']} ({irrationality['score']}) | {irrationality['label']} | {irrationality['explanation']}\n"
             f"Overbought indicator: {overbought['level']} ({overbought['score']}) | {overbought['label']} | RSI {overbought['rsi']} | VWAP extension {overbought['vwapExtensionPct']}% | {overbought['explanation']}\n"
+            f"Key levels: {levels['status']} | current {levels['current']} | support {levels['nearestSupport']} ({levels['supportDistancePct']}% away) | resistance {levels['nearestResistance']} ({levels['resistanceDistancePct']}% away) | {levels['explanation']}\n"
             f"Recent text:\n{headlines}\n"
-            "Return exactly five sentences: setup, MACD significance, overbought read, irrationality/overreaction read, then main risk."
+            "Return exactly six sentences: setup, key levels, MACD significance, overbought read, irrationality/overreaction read, then main risk."
         ),
     }
     response = requests.post(
@@ -521,6 +570,7 @@ def analyze(symbol):
     sentiment = aggregate_sentiment(analyzed)
     tech = technicals(candles, volume)
     tech["macdSignificance"] = macd_significance(tech["macdHistogram"], tech["bias"])
+    levels = key_levels(candles, tech)
     volume_view = volume_analysis(candles, volume)
     overbought = overbought_indicator(tech, volume_view)
     risk = risk_score(candles, sentiment)
@@ -528,14 +578,16 @@ def analyze(symbol):
     volume_boost = max(-0.08, min(0.08, (volume_view["ratio"] - 1) * 0.06))
     irrationality_penalty = irrationality["score"] * 0.08
     overbought_penalty = overbought["score"] * 0.06
-    confidence = max(0, min(1, ((tech["trendStrength"] + 1) / 2) * 0.38 + ((sentiment["score"] + 1) / 2) * 0.34 + volume_boost - risk["score"] * 0.2 - irrationality_penalty - overbought_penalty + 0.16))
+    level_adjustment = 0.04 if levels["status"] == "Breakout" else -0.05 if levels["status"] in {"Breakdown", "Near resistance"} else 0
+    confidence = max(0, min(1, ((tech["trendStrength"] + 1) / 2) * 0.38 + ((sentiment["score"] + 1) / 2) * 0.34 + volume_boost + level_adjustment - risk["score"] * 0.2 - irrationality_penalty - overbought_penalty + 0.16))
     try:
-        explanation = openai_explanation(symbol, tech, sentiment, risk, volume_view, irrationality, overbought, confidence, analyzed)
+        explanation = openai_explanation(symbol, tech, sentiment, risk, volume_view, irrationality, overbought, levels, confidence, analyzed)
         ai_mode = "OpenAI"
     except Exception as error:
         explanation = (
             f"{symbol} has a {round(confidence * 100)}% trade confidence score because {tech['bias'].lower()} "
             f"and {sentiment['label'].lower()} NLP sentiment are being weighed against {risk['level'].lower()} risk. "
+            f"Key levels status: {levels['status'].lower()}. "
             f"{tech['macdSignificance']} Volume is classified as {volume_view['label'].lower()}: {volume_view['explanation']} "
             f"Overbought indicator: {overbought['label'].lower()}. Irrationality gauge: {irrationality['label'].lower()}."
         )
@@ -547,6 +599,7 @@ def analyze(symbol):
         "provider": provider,
         "sentiment": sentiment,
         "technicals": tech,
+        "keyLevels": levels,
         "volumeAnalysis": volume_view,
         "overbought": overbought,
         "irrationality": irrationality,
@@ -581,6 +634,18 @@ if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
                     "trendStrength": 0,
                     "bias": "Setup Required",
                     "macdSignificance": "Setup required.",
+                },
+                "keyLevels": {
+                    "status": "Setup Required",
+                    "current": 0,
+                    "nearestSupport": 0,
+                    "nearestResistance": 0,
+                    "supportDistancePct": 0,
+                    "resistanceDistancePct": 0,
+                    "recentHigh": 0,
+                    "recentLow": 0,
+                    "vwap": 0,
+                    "explanation": "Setup required.",
                 },
                 "volumeAnalysis": {
                     "label": "Setup Required",
@@ -648,6 +713,16 @@ with st.expander("Technical Indicators", expanded=False):
     metrics[2].metric("MACD Hist", analysis["technicals"]["macdHistogram"])
     metrics[3].metric("Trend", analysis["technicals"]["bias"])
     st.markdown(f"**MACD significance:** {analysis['technicals']['macdSignificance']}")
+
+with st.expander("Key Levels", expanded=True):
+    levels = analysis["keyLevels"]
+    level_cols = st.columns(4)
+    level_cols[0].metric("Level Status", levels["status"])
+    level_cols[1].metric("Nearest Support", f"${levels['nearestSupport']}", f"{levels['supportDistancePct']}% below")
+    level_cols[2].metric("Nearest Resistance", f"${levels['nearestResistance']}", f"{levels['resistanceDistancePct']}% above")
+    level_cols[3].metric("VWAP", f"${levels['vwap']}")
+    st.write(levels["explanation"])
+    st.write(f"Recent high: ${levels['recentHigh']} | Recent low: ${levels['recentLow']} | Current: ${levels['current']}")
 
 with st.expander("Volume Analysis", expanded=True):
     volume_view = analysis["volumeAnalysis"]
