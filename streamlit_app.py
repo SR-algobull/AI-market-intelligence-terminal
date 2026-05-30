@@ -361,6 +361,71 @@ def volume_analysis(candles, volume):
     }
 
 
+def irrationality_gauge(analyzed_items, sentiment, tech, risk, volume_view):
+    if not analyzed_items:
+        return {
+            "score": 0,
+            "level": "Low",
+            "label": "No signal",
+            "explanation": "There is not enough live text data to evaluate market overreaction.",
+            "drivers": [],
+        }
+
+    severe_events = {"Earnings", "Regulatory", "Macro/Fed"}
+    high_signal_items = [
+        item for item in analyzed_items if abs(item["sentiment"]["score"]) >= 0.45 or item["sentiment"]["confidence"] >= 0.7
+    ]
+    low_severity_share = sum(item["eventType"] not in severe_events for item in high_signal_items) / max(1, len(high_signal_items))
+    source_mix = {item["source"] for item in analyzed_items[:10]}
+    social_heavy = sum(item["source"] == "stocktwits" for item in analyzed_items[:10]) / max(1, min(10, len(analyzed_items)))
+    sentiment_intensity = min(1, abs(sentiment["score"]) * 1.6)
+    price_confirmation = min(1, abs(tech["trendStrength"]))
+    volume_confirmation = min(1.4, volume_view["ratio"]) / 1.4
+    risk_confirmation = risk["score"]
+
+    hype_without_confirmation = max(0, sentiment_intensity - (price_confirmation * 0.35 + volume_confirmation * 0.25 + risk_confirmation * 0.2))
+    social_amplifier = 0.16 if social_heavy >= 0.55 else 0
+    weak_event_amplifier = 0.18 * low_severity_share
+    single_source_penalty = 0.08 if len(source_mix) == 1 else 0
+    score = max(0, min(1, hype_without_confirmation + social_amplifier + weak_event_amplifier + single_source_penalty))
+
+    if score >= 0.68:
+        level = "High"
+        label = "Likely overreaction"
+    elif score >= 0.42:
+        level = "Moderate"
+        label = "Possible overreaction"
+    else:
+        level = "Low"
+        label = "Reaction looks supported"
+
+    drivers = [
+        f"Sentiment intensity: {round(sentiment_intensity, 2)}",
+        f"Price confirmation: {round(price_confirmation, 2)}",
+        f"Volume confirmation: {round(volume_confirmation, 2)}",
+        f"Low-severity high-emotion share: {round(low_severity_share, 2)}",
+    ]
+
+    if score >= 0.42:
+        explanation = (
+            "The market may be overreacting because sentiment is stronger than the confirmation from price, volume, risk, "
+            "or event severity. This is a cue to investigate the actual catalyst before trusting the crowd reaction."
+        )
+    else:
+        explanation = (
+            "The reaction appears reasonably supported by price, volume, risk, or event context, so the model is not flagging "
+            "a major irrationality gap."
+        )
+
+    return {
+        "score": round(score, 2),
+        "level": level,
+        "label": label,
+        "explanation": explanation,
+        "drivers": drivers,
+    }
+
+
 def risk_score(candles, sentiment):
     returns = [(candles[index] - candles[index - 1]) / candles[index - 1] for index in range(1, len(candles))]
     mean = sum(returns) / len(returns)
@@ -369,7 +434,7 @@ def risk_score(candles, sentiment):
     return {"score": round(score, 2), "level": "High" if score > 0.68 else "Moderate" if score > 0.42 else "Low"}
 
 
-def openai_explanation(symbol, tech, sentiment, risk, volume, confidence, items):
+def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, confidence, items):
     api_key = secret("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -384,8 +449,9 @@ def openai_explanation(symbol, tech, sentiment, risk, volume, confidence, items)
             f"Risk: {risk['level']} {risk['score']}\nRSI: {tech['rsi']}\n"
             f"MACD histogram: {tech['macdHistogram']}\nMACD significance: {tech['macdSignificance']}\n"
             f"Volume: {volume['label']} | ratio {volume['ratio']}x | {volume['explanation']}\n"
+            f"Market irrationality gauge: {irrationality['level']} ({irrationality['score']}) | {irrationality['label']} | {irrationality['explanation']}\n"
             f"Recent text:\n{headlines}\n"
-            "Return exactly three sentences: setup, MACD significance, then main risk."
+            "Return exactly four sentences: setup, MACD significance, irrationality/overreaction read, then main risk."
         ),
     }
     response = requests.post(
@@ -418,16 +484,19 @@ def analyze(symbol):
     tech["macdSignificance"] = macd_significance(tech["macdHistogram"], tech["bias"])
     volume_view = volume_analysis(candles, volume)
     risk = risk_score(candles, sentiment)
+    irrationality = irrationality_gauge(analyzed, sentiment, tech, risk, volume_view)
     volume_boost = max(-0.08, min(0.08, (volume_view["ratio"] - 1) * 0.06))
-    confidence = max(0, min(1, ((tech["trendStrength"] + 1) / 2) * 0.38 + ((sentiment["score"] + 1) / 2) * 0.34 + volume_boost - risk["score"] * 0.2 + 0.16))
+    irrationality_penalty = irrationality["score"] * 0.08
+    confidence = max(0, min(1, ((tech["trendStrength"] + 1) / 2) * 0.38 + ((sentiment["score"] + 1) / 2) * 0.34 + volume_boost - risk["score"] * 0.2 - irrationality_penalty + 0.16))
     try:
-        explanation = openai_explanation(symbol, tech, sentiment, risk, volume_view, confidence, analyzed)
+        explanation = openai_explanation(symbol, tech, sentiment, risk, volume_view, irrationality, confidence, analyzed)
         ai_mode = "OpenAI"
     except Exception as error:
         explanation = (
             f"{symbol} has a {round(confidence * 100)}% trade confidence score because {tech['bias'].lower()} "
             f"and {sentiment['label'].lower()} NLP sentiment are being weighed against {risk['level'].lower()} risk. "
-            f"{tech['macdSignificance']} Volume is classified as {volume_view['label'].lower()}: {volume_view['explanation']}"
+            f"{tech['macdSignificance']} Volume is classified as {volume_view['label'].lower()}: {volume_view['explanation']} "
+            f"Irrationality gauge: {irrationality['label'].lower()}."
         )
         ai_mode = f"Rules ({str(error)[:80]})"
     return {
@@ -438,6 +507,7 @@ def analyze(symbol):
         "sentiment": sentiment,
         "technicals": tech,
         "volumeAnalysis": volume_view,
+        "irrationality": irrationality,
         "risk": risk,
         "confidence": confidence,
         "explanation": explanation,
@@ -478,6 +548,13 @@ if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
                     "trend": 0,
                     "priceChangePct": 0,
                     "explanation": "Setup required.",
+                },
+                "irrationality": {
+                    "score": 0,
+                    "level": "Setup Required",
+                    "label": "Setup Required",
+                    "explanation": "Setup required.",
+                    "drivers": [],
                 },
                 "risk": {"score": 0, "level": "Setup Required"},
                 "confidence": 0,
@@ -530,6 +607,18 @@ with st.expander("Volume Analysis", expanded=True):
     volume_cols[2].metric("Vs Baseline", f"{volume_view['ratio']}x")
     volume_cols[3].metric("Price Change", f"{volume_view['priceChangePct']}%")
     st.write(volume_view["explanation"])
+
+with st.expander("Market Irrationality Gauge", expanded=True):
+    irrationality = analysis["irrationality"]
+    irr_cols = st.columns(3)
+    irr_cols[0].metric("Irrationality", irrationality["level"])
+    irr_cols[1].metric("Gauge Score", f"{round(irrationality['score'] * 100)}%")
+    irr_cols[2].metric("Read", irrationality["label"])
+    st.write(irrationality["explanation"])
+    if irrationality["drivers"]:
+        st.markdown("**Drivers**")
+        for driver in irrationality["drivers"]:
+            st.write(f"- {driver}")
 
 with st.expander("Risk Engine", expanded=False):
     st.metric("Risk Level", analysis["risk"]["level"], f"{analysis['risk']['score']} risk index")
