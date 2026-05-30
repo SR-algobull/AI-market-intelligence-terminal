@@ -67,6 +67,50 @@ EVENT_RULES = {
     "Product/AI": ["ai", "gpu", "iphone", "roadmap", "features"],
 }
 
+DEMO_MARKET = {
+    "NVDA": {
+        "candles": [
+            906, 912, 918, 913, 927, 944, 951, 948, 959, 971, 964, 982,
+            995, 1004, 1018, 1032, 1027, 1048, 1064, 1080, 1074, 1095, 1112, 1121,
+        ],
+        "volume": [
+            44, 47, 48, 46, 52, 56, 58, 55, 60, 65, 62, 68,
+            72, 73, 76, 82, 79, 86, 91, 94, 90, 98, 103, 108,
+        ],
+    },
+    "TSLA": {
+        "candles": [
+            178, 181, 176, 174, 169, 171, 168, 165, 162, 164, 159, 156,
+            158, 153, 150, 148, 151, 146, 144, 142, 145, 141, 139, 136,
+        ],
+        "volume": [
+            75, 78, 81, 84, 88, 82, 90, 92, 95, 89, 101, 104,
+            96, 108, 112, 118, 105, 121, 126, 129, 118, 132, 137, 140,
+        ],
+    },
+}
+
+DEMO_TEXT = [
+    {
+        "id": "demo-earnings",
+        "source": "demo-news",
+        "timestamp": "2026-05-25T13:00:00Z",
+        "text": "NVIDIA beat revenue expectations as data center demand accelerated and management raised guidance.",
+    },
+    {
+        "id": "demo-sector",
+        "source": "demo-news",
+        "timestamp": "2026-05-25T12:00:00Z",
+        "text": "Semiconductor stocks rallied after cloud capex commentary improved across hyperscalers.",
+    },
+    {
+        "id": "demo-social",
+        "source": "demo-social",
+        "timestamp": "2026-05-25T11:00:00Z",
+        "text": "Traders warn that valuation is stretched, but momentum remains strong into the AI conference.",
+    },
+]
+
 STREAMLIT_SECRETS_TEMPLATE = """ALPACA_API_KEY = "your_alpaca_key"
 ALPACA_API_SECRET = "your_alpaca_secret"
 ALPACA_DATA_FEED = "iex"
@@ -242,6 +286,11 @@ def fetch_stocktwits(symbol):
     ]
 
 
+def demo_market(symbol):
+    market = DEMO_MARKET.get(symbol, DEMO_MARKET["NVDA"])
+    return market["candles"], market["volume"], "demo"
+
+
 def rsi(candles, period=14):
     changes = [candles[index] - candles[index - 1] for index in range(1, len(candles))]
     recent = changes[-period:]
@@ -320,34 +369,14 @@ def openai_explanation(symbol, tech, sentiment, risk, confidence, items):
 def analyze(symbol):
     candles, volume, provider = fetch_alpaca(symbol)
     if not candles or not volume:
-        setup_message = (
-            "Add valid Alpaca credentials in Streamlit Cloud Secrets to enable live market data. "
-            "Required keys: ALPACA_API_KEY, ALPACA_API_SECRET, and ALPACA_DATA_FEED. "
-            f"Current provider status: {provider}."
-        )
-        return {
-            "symbol": symbol,
-            "candles": [],
-            "volume": [],
-            "provider": provider,
-            "sentiment": {"label": "Setup Required", "score": 0, "confidence": 0, "topEvents": []},
-            "technicals": {
-                "lastPrice": 0,
-                "rsi": 0,
-                "vwap": 0,
-                "macdHistogram": 0,
-                "trendStrength": 0,
-                "bias": "Setup Required",
-            },
-            "risk": {"score": 0, "level": "Setup Required"},
-            "confidence": 0,
-            "explanation": setup_message,
-            "aiMode": "Setup Required",
-            "analyzed": [],
-            "setupError": True,
-        }
+        provider_status = provider
+        candles, volume, provider = demo_market(symbol)
+    else:
+        provider_status = None
 
     text_items = fetch_finnhub_news(symbol) + fetch_stocktwits(symbol)
+    if not text_items:
+        text_items = DEMO_TEXT
     analyzed = analyze_text(text_items)
     sentiment = aggregate_sentiment(analyzed)
     tech = technicals(candles, volume)
@@ -374,6 +403,7 @@ def analyze(symbol):
         "explanation": explanation,
         "aiMode": ai_mode,
         "analyzed": analyzed,
+        "providerStatus": provider_status,
     }
 
 
@@ -418,6 +448,12 @@ if analysis.get("setupError"):
     st.error(analysis["explanation"])
     st.code(STREAMLIT_SECRETS_TEMPLATE, language="toml")
     st.stop()
+
+if analysis.get("providerStatus"):
+    st.warning(
+        "Live Alpaca data is not active, so this session is using demo market data. "
+        f"Provider status: {analysis['providerStatus']}. Add Streamlit Secrets to enable live mode."
+    )
 
 left, right = st.columns([0.9, 1.3])
 with left:
