@@ -361,6 +361,44 @@ def volume_analysis(candles, volume):
     }
 
 
+def overbought_indicator(tech, volume_view):
+    price = tech["lastPrice"]
+    vwap = tech["vwap"]
+    rsi_value = tech["rsi"]
+    vwap_extension = ((price - vwap) / vwap) if vwap else 0
+
+    rsi_pressure = max(0, (rsi_value - 60) / 25)
+    vwap_pressure = max(0, vwap_extension / 0.08)
+    volume_pressure = max(0, min(1, (volume_view["ratio"] - 1) / 1.2))
+    score = max(0, min(1, rsi_pressure * 0.55 + vwap_pressure * 0.3 + volume_pressure * 0.15))
+
+    if rsi_value >= 75 or score >= 0.72:
+        level = "High"
+        label = "Overbought risk"
+        explanation = "Price is extended relative to momentum and/or VWAP, so chasing strength carries elevated pullback risk."
+    elif rsi_value >= 65 or score >= 0.45:
+        level = "Moderate"
+        label = "Getting extended"
+        explanation = "Momentum is firm, but the setup is becoming stretched; confirmation matters before adding exposure."
+    elif rsi_value <= 35:
+        level = "Low"
+        label = "Oversold / not overbought"
+        explanation = "RSI is low enough that the stock is not overbought; downside exhaustion or mean reversion may matter more."
+    else:
+        level = "Low"
+        label = "Not overbought"
+        explanation = "RSI and VWAP extension do not show a major overbought condition."
+
+    return {
+        "score": round(score, 2),
+        "level": level,
+        "label": label,
+        "rsi": rsi_value,
+        "vwapExtensionPct": round(vwap_extension * 100, 2),
+        "explanation": explanation,
+    }
+
+
 def irrationality_gauge(analyzed_items, sentiment, tech, risk, volume_view):
     if not analyzed_items:
         return {
@@ -434,7 +472,7 @@ def risk_score(candles, sentiment):
     return {"score": round(score, 2), "level": "High" if score > 0.68 else "Moderate" if score > 0.42 else "Low"}
 
 
-def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, confidence, items):
+def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, overbought, confidence, items):
     api_key = secret("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -450,8 +488,9 @@ def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, con
             f"MACD histogram: {tech['macdHistogram']}\nMACD significance: {tech['macdSignificance']}\n"
             f"Volume: {volume['label']} | ratio {volume['ratio']}x | {volume['explanation']}\n"
             f"Market irrationality gauge: {irrationality['level']} ({irrationality['score']}) | {irrationality['label']} | {irrationality['explanation']}\n"
+            f"Overbought indicator: {overbought['level']} ({overbought['score']}) | {overbought['label']} | RSI {overbought['rsi']} | VWAP extension {overbought['vwapExtensionPct']}% | {overbought['explanation']}\n"
             f"Recent text:\n{headlines}\n"
-            "Return exactly four sentences: setup, MACD significance, irrationality/overreaction read, then main risk."
+            "Return exactly five sentences: setup, MACD significance, overbought read, irrationality/overreaction read, then main risk."
         ),
     }
     response = requests.post(
@@ -483,20 +522,22 @@ def analyze(symbol):
     tech = technicals(candles, volume)
     tech["macdSignificance"] = macd_significance(tech["macdHistogram"], tech["bias"])
     volume_view = volume_analysis(candles, volume)
+    overbought = overbought_indicator(tech, volume_view)
     risk = risk_score(candles, sentiment)
     irrationality = irrationality_gauge(analyzed, sentiment, tech, risk, volume_view)
     volume_boost = max(-0.08, min(0.08, (volume_view["ratio"] - 1) * 0.06))
     irrationality_penalty = irrationality["score"] * 0.08
-    confidence = max(0, min(1, ((tech["trendStrength"] + 1) / 2) * 0.38 + ((sentiment["score"] + 1) / 2) * 0.34 + volume_boost - risk["score"] * 0.2 - irrationality_penalty + 0.16))
+    overbought_penalty = overbought["score"] * 0.06
+    confidence = max(0, min(1, ((tech["trendStrength"] + 1) / 2) * 0.38 + ((sentiment["score"] + 1) / 2) * 0.34 + volume_boost - risk["score"] * 0.2 - irrationality_penalty - overbought_penalty + 0.16))
     try:
-        explanation = openai_explanation(symbol, tech, sentiment, risk, volume_view, irrationality, confidence, analyzed)
+        explanation = openai_explanation(symbol, tech, sentiment, risk, volume_view, irrationality, overbought, confidence, analyzed)
         ai_mode = "OpenAI"
     except Exception as error:
         explanation = (
             f"{symbol} has a {round(confidence * 100)}% trade confidence score because {tech['bias'].lower()} "
             f"and {sentiment['label'].lower()} NLP sentiment are being weighed against {risk['level'].lower()} risk. "
             f"{tech['macdSignificance']} Volume is classified as {volume_view['label'].lower()}: {volume_view['explanation']} "
-            f"Irrationality gauge: {irrationality['label'].lower()}."
+            f"Overbought indicator: {overbought['label'].lower()}. Irrationality gauge: {irrationality['label'].lower()}."
         )
         ai_mode = f"Rules ({str(error)[:80]})"
     return {
@@ -507,6 +548,7 @@ def analyze(symbol):
         "sentiment": sentiment,
         "technicals": tech,
         "volumeAnalysis": volume_view,
+        "overbought": overbought,
         "irrationality": irrationality,
         "risk": risk,
         "confidence": confidence,
@@ -547,6 +589,14 @@ if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
                     "ratio": 0,
                     "trend": 0,
                     "priceChangePct": 0,
+                    "explanation": "Setup required.",
+                },
+                "overbought": {
+                    "score": 0,
+                    "level": "Setup Required",
+                    "label": "Setup Required",
+                    "rsi": 0,
+                    "vwapExtensionPct": 0,
                     "explanation": "Setup required.",
                 },
                 "irrationality": {
@@ -607,6 +657,15 @@ with st.expander("Volume Analysis", expanded=True):
     volume_cols[2].metric("Vs Baseline", f"{volume_view['ratio']}x")
     volume_cols[3].metric("Price Change", f"{volume_view['priceChangePct']}%")
     st.write(volume_view["explanation"])
+
+with st.expander("Overbought Indicator", expanded=True):
+    overbought = analysis["overbought"]
+    over_cols = st.columns(4)
+    over_cols[0].metric("Overbought", overbought["level"])
+    over_cols[1].metric("Gauge Score", f"{round(overbought['score'] * 100)}%")
+    over_cols[2].metric("RSI", overbought["rsi"])
+    over_cols[3].metric("VWAP Extension", f"{overbought['vwapExtensionPct']}%")
+    st.write(overbought["explanation"])
 
 with st.expander("Market Irrationality Gauge", expanded=True):
     irrationality = analysis["irrationality"]
