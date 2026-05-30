@@ -315,6 +315,52 @@ def technicals(candles, volume):
     }
 
 
+def macd_significance(histogram, trend_bias):
+    if histogram > 0.25 and trend_bias == "Bullish Momentum":
+        return "MACD confirms bullish momentum because the fast trend is above the slower trend and expansion is positive."
+    if histogram > 0:
+        return "MACD is mildly constructive, but the signal is not strong enough by itself; confirmation from price and volume matters."
+    if histogram < -0.25 and trend_bias == "Bearish Momentum":
+        return "MACD confirms bearish pressure because downside momentum is expanding below the signal line."
+    if histogram < 0:
+        return "MACD is a caution flag: momentum is cooling even if price trend has not fully broken down."
+    return "MACD is neutral, so the model leans more heavily on price trend, volume, sentiment, and risk."
+
+
+def volume_analysis(candles, volume):
+    recent_volume = volume[-1]
+    baseline = sum(volume[:-1]) / max(1, len(volume) - 1)
+    volume_ratio = recent_volume / baseline if baseline else 1
+    price_change = (candles[-1] - candles[-2]) / candles[-2] if len(candles) > 1 else 0
+    volume_trend = (sum(volume[-5:]) / 5) / max(0.001, sum(volume[:5]) / 5)
+
+    if volume_ratio >= 1.5 and price_change > 0:
+        label = "Bullish accumulation"
+        explanation = "Price is rising on above-normal volume, which suggests buyers are participating rather than price drifting up on thin liquidity."
+    elif volume_ratio >= 1.5 and price_change < 0:
+        label = "Distribution pressure"
+        explanation = "Price is falling on above-normal volume, which can signal heavier selling pressure or institutional distribution."
+    elif volume_ratio <= 0.75 and abs(price_change) < 0.01:
+        label = "Low-conviction consolidation"
+        explanation = "Volume is below normal and price movement is muted, so the setup has less confirmation."
+    elif volume_trend > 1.25:
+        label = "Participation increasing"
+        explanation = "Recent volume is trending above the early-period baseline, which means market participation is expanding."
+    else:
+        label = "Normal participation"
+        explanation = "Volume is close to baseline, so the model treats price and sentiment signals as more important than volume."
+
+    return {
+        "label": label,
+        "latest": round(recent_volume, 2),
+        "baseline": round(baseline, 2),
+        "ratio": round(volume_ratio, 2),
+        "trend": round(volume_trend, 2),
+        "priceChangePct": round(price_change * 100, 2),
+        "explanation": explanation,
+    }
+
+
 def risk_score(candles, sentiment):
     returns = [(candles[index] - candles[index - 1]) / candles[index - 1] for index in range(1, len(candles))]
     mean = sum(returns) / len(returns)
@@ -323,7 +369,7 @@ def risk_score(candles, sentiment):
     return {"score": round(score, 2), "level": "High" if score > 0.68 else "Moderate" if score > 0.42 else "Low"}
 
 
-def openai_explanation(symbol, tech, sentiment, risk, confidence, items):
+def openai_explanation(symbol, tech, sentiment, risk, volume, confidence, items):
     api_key = secret("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -336,8 +382,10 @@ def openai_explanation(symbol, tech, sentiment, risk, confidence, items):
             f"Ticker: {symbol}\nConfidence: {round(confidence * 100)}%\n"
             f"Regime: {tech['bias']}\nSentiment: {sentiment['label']} {sentiment['score']}\n"
             f"Risk: {risk['level']} {risk['score']}\nRSI: {tech['rsi']}\n"
-            f"MACD histogram: {tech['macdHistogram']}\nRecent text:\n{headlines}\n"
-            "Return exactly two sentences: setup then risk."
+            f"MACD histogram: {tech['macdHistogram']}\nMACD significance: {tech['macdSignificance']}\n"
+            f"Volume: {volume['label']} | ratio {volume['ratio']}x | {volume['explanation']}\n"
+            f"Recent text:\n{headlines}\n"
+            "Return exactly three sentences: setup, MACD significance, then main risk."
         ),
     }
     response = requests.post(
@@ -367,15 +415,19 @@ def analyze(symbol):
     analyzed = analyze_text(text_items)
     sentiment = aggregate_sentiment(analyzed)
     tech = technicals(candles, volume)
+    tech["macdSignificance"] = macd_significance(tech["macdHistogram"], tech["bias"])
+    volume_view = volume_analysis(candles, volume)
     risk = risk_score(candles, sentiment)
-    confidence = max(0, min(1, ((tech["trendStrength"] + 1) / 2) * 0.42 + ((sentiment["score"] + 1) / 2) * 0.36 - risk["score"] * 0.2 + 0.14))
+    volume_boost = max(-0.08, min(0.08, (volume_view["ratio"] - 1) * 0.06))
+    confidence = max(0, min(1, ((tech["trendStrength"] + 1) / 2) * 0.38 + ((sentiment["score"] + 1) / 2) * 0.34 + volume_boost - risk["score"] * 0.2 + 0.16))
     try:
-        explanation = openai_explanation(symbol, tech, sentiment, risk, confidence, analyzed)
+        explanation = openai_explanation(symbol, tech, sentiment, risk, volume_view, confidence, analyzed)
         ai_mode = "OpenAI"
     except Exception as error:
         explanation = (
             f"{symbol} has a {round(confidence * 100)}% trade confidence score because {tech['bias'].lower()} "
-            f"and {sentiment['label'].lower()} NLP sentiment are being weighed against {risk['level'].lower()} risk."
+            f"and {sentiment['label'].lower()} NLP sentiment are being weighed against {risk['level'].lower()} risk. "
+            f"{tech['macdSignificance']} Volume is classified as {volume_view['label'].lower()}: {volume_view['explanation']}"
         )
         ai_mode = f"Rules ({str(error)[:80]})"
     return {
@@ -385,6 +437,7 @@ def analyze(symbol):
         "provider": provider,
         "sentiment": sentiment,
         "technicals": tech,
+        "volumeAnalysis": volume_view,
         "risk": risk,
         "confidence": confidence,
         "explanation": explanation,
@@ -415,6 +468,16 @@ if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
                     "macdHistogram": 0,
                     "trendStrength": 0,
                     "bias": "Setup Required",
+                    "macdSignificance": "Setup required.",
+                },
+                "volumeAnalysis": {
+                    "label": "Setup Required",
+                    "latest": 0,
+                    "baseline": 0,
+                    "ratio": 0,
+                    "trend": 0,
+                    "priceChangePct": 0,
+                    "explanation": "Setup required.",
                 },
                 "risk": {"score": 0, "level": "Setup Required"},
                 "confidence": 0,
@@ -438,29 +501,44 @@ if analysis.get("providerStatus"):
         f"Provider status: {analysis['providerStatus']}. Add Streamlit Secrets to enable live mode."
     )
 
-left, right = st.columns([0.9, 1.3])
-with left:
-    st.metric("Trade Confidence", f"{round(analysis['confidence'] * 100)}%")
-    st.metric("Sentiment", analysis["sentiment"]["label"], f"{analysis['sentiment']['score']} NLP score")
-    st.metric("Risk", analysis["risk"]["level"], f"{analysis['risk']['score']} risk index")
+with st.expander("Decision Overview", expanded=True):
+    overview = st.columns(3)
+    overview[0].metric("Trade Confidence", f"{round(analysis['confidence'] * 100)}%")
+    overview[1].metric("Sentiment", analysis["sentiment"]["label"], f"{analysis['sentiment']['score']} NLP score")
+    overview[2].metric("Risk", analysis["risk"]["level"], f"{analysis['risk']['score']} risk index")
     st.write(analysis["explanation"])
 
-with right:
+with st.expander("Price + Volume Chart", expanded=True):
     chart_df = pd.DataFrame({"day": range(len(analysis["candles"])), "price": analysis["candles"], "volume": analysis["volume"]})
     line = alt.Chart(chart_df).mark_line(point=True).encode(x="day", y=alt.Y("price", scale=alt.Scale(zero=False)))
     bars = alt.Chart(chart_df).mark_bar(opacity=0.25).encode(x="day", y="volume")
     st.altair_chart(line | bars, use_container_width=True)
 
-metrics = st.columns(4)
-metrics[0].metric("RSI", analysis["technicals"]["rsi"])
-metrics[1].metric("VWAP", f"${analysis['technicals']['vwap']}")
-metrics[2].metric("MACD Hist", analysis["technicals"]["macdHistogram"])
-metrics[3].metric("Trend", analysis["technicals"]["bias"])
+with st.expander("Technical Indicators", expanded=False):
+    metrics = st.columns(4)
+    metrics[0].metric("RSI", analysis["technicals"]["rsi"])
+    metrics[1].metric("VWAP", f"${analysis['technicals']['vwap']}")
+    metrics[2].metric("MACD Hist", analysis["technicals"]["macdHistogram"])
+    metrics[3].metric("Trend", analysis["technicals"]["bias"])
+    st.markdown(f"**MACD significance:** {analysis['technicals']['macdSignificance']}")
 
-st.subheader("News + StockTwits NLP Feed")
-for item in analysis["analyzed"][:20]:
-    sent = item["sentiment"]
-    st.markdown(
-        f"**{item['source']} | {item['eventType']} | {sent['label']} {round(sent['confidence'] * 100)}%**  \n"
-        f"{item['text']}"
-    )
+with st.expander("Volume Analysis", expanded=True):
+    volume_view = analysis["volumeAnalysis"]
+    volume_cols = st.columns(4)
+    volume_cols[0].metric("Volume Signal", volume_view["label"])
+    volume_cols[1].metric("Latest Volume", f"{volume_view['latest']}M")
+    volume_cols[2].metric("Vs Baseline", f"{volume_view['ratio']}x")
+    volume_cols[3].metric("Price Change", f"{volume_view['priceChangePct']}%")
+    st.write(volume_view["explanation"])
+
+with st.expander("Risk Engine", expanded=False):
+    st.metric("Risk Level", analysis["risk"]["level"], f"{analysis['risk']['score']} risk index")
+    st.write("Risk combines realized price volatility with the strength and uncertainty of NLP sentiment.")
+
+with st.expander("News + StockTwits NLP Feed", expanded=False):
+    for item in analysis["analyzed"][:20]:
+        sent = item["sentiment"]
+        st.markdown(
+            f"**{item['source']} | {item['eventType']} | {sent['label']} {round(sent['confidence'] * 100)}%**  \n"
+            f"{item['text']}"
+        )
