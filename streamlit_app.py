@@ -67,6 +67,18 @@ EVENT_RULES = {
     "Product/AI": ["ai", "gpu", "iphone", "roadmap", "features"],
 }
 
+STREAMLIT_SECRETS_TEMPLATE = """ALPACA_API_KEY = "your_alpaca_key"
+ALPACA_API_SECRET = "your_alpaca_secret"
+ALPACA_DATA_FEED = "iex"
+
+FINNHUB_API_KEY = "your_finnhub_key"
+
+OPENAI_API_KEY = "your_openai_key"
+OPENAI_MODEL = "gpt-5.2"
+
+STOCKTWITS_USERNAME = "your_stocktwits_email"
+STOCKTWITS_PASSWORD = "your_stocktwits_password" """
+
 
 def secret(name, default=""):
     try:
@@ -206,8 +218,14 @@ def fetch_finnhub_news(symbol):
 
 def fetch_stocktwits(symbol):
     url = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
+    headers = {}
+    username = secret("STOCKTWITS_USERNAME")
+    password = secret("STOCKTWITS_PASSWORD")
+    if username and password:
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        headers["authorization"] = f"Basic {token}"
     try:
-        payload = get_json(url)
+        payload = get_json(url, headers=headers)
     except Exception:
         return []
     return [
@@ -355,6 +373,10 @@ def analyze(symbol):
 
 
 st.title("AI Market Intelligence Terminal")
+with st.sidebar.expander("Streamlit Secrets", expanded=False):
+    st.write("Paste this into Streamlit Cloud > Manage app > Settings > Secrets.")
+    st.code(STREAMLIT_SECRETS_TEMPLATE, language="toml")
+
 symbol = st.text_input("Ticker", "NVDA").upper().strip() or "NVDA"
 
 if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
@@ -366,15 +388,7 @@ st.caption(f"LIVE DATA ({analysis['provider']}) | STOCKTWITS SOCIAL | {analysis[
 
 if analysis.get("setupError"):
     st.error("Missing Alpaca credentials in Streamlit Cloud Secrets.")
-    st.code(
-        """ALPACA_API_KEY = "your_alpaca_key"
-ALPACA_API_SECRET = "your_alpaca_secret"
-ALPACA_DATA_FEED = "iex"
-FINNHUB_API_KEY = "your_finnhub_key"
-OPENAI_API_KEY = "your_openai_key"
-OPENAI_MODEL = "gpt-5.2" """,
-        language="toml",
-    )
+    st.code(STREAMLIT_SECRETS_TEMPLATE, language="toml")
     st.stop()
 
 left, right = st.columns([0.9, 1.3])
