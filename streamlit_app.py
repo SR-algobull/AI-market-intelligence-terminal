@@ -185,8 +185,11 @@ def fetch_alpaca(symbol):
         "feed": feed,
     }
     latest_url = f"https://data.alpaca.markets/v2/stocks/{symbol}/quotes/latest?feed={feed}"
-    bars = get_json(bars_url, headers=headers, params=bar_params).get("bars", {}).get(symbol, [])
-    latest = get_json(latest_url, headers=headers).get("quote", {})
+    try:
+        bars = get_json(bars_url, headers=headers, params=bar_params).get("bars", {}).get(symbol, [])
+        latest = get_json(latest_url, headers=headers).get("quote", {})
+    except Exception as error:
+        return None, None, f"alpaca-error: {str(error)[:140]}"
     candles = [bar["c"] for bar in bars][-24:]
     volume = [(bar.get("v") or 0) / 1_000_000 for bar in bars][-24:]
     if candles and latest.get("ap") and latest.get("bp"):
@@ -317,6 +320,11 @@ def openai_explanation(symbol, tech, sentiment, risk, confidence, items):
 def analyze(symbol):
     candles, volume, provider = fetch_alpaca(symbol)
     if not candles or not volume:
+        setup_message = (
+            "Add valid Alpaca credentials in Streamlit Cloud Secrets to enable live market data. "
+            "Required keys: ALPACA_API_KEY, ALPACA_API_SECRET, and ALPACA_DATA_FEED. "
+            f"Current provider status: {provider}."
+        )
         return {
             "symbol": symbol,
             "candles": [],
@@ -333,10 +341,7 @@ def analyze(symbol):
             },
             "risk": {"score": 0, "level": "Setup Required"},
             "confidence": 0,
-            "explanation": (
-                "Add Alpaca credentials in Streamlit Cloud Secrets to enable live market data. "
-                "Required keys: ALPACA_API_KEY, ALPACA_API_SECRET, and ALPACA_DATA_FEED."
-            ),
+            "explanation": setup_message,
             "aiMode": "Setup Required",
             "analyzed": [],
             "setupError": True,
@@ -381,13 +386,36 @@ symbol = st.text_input("Ticker", "NVDA").upper().strip() or "NVDA"
 
 if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
     with st.spinner("Pulling market, news, social, and AI signals..."):
-        st.session_state.analysis = analyze(symbol)
+        try:
+            st.session_state.analysis = analyze(symbol)
+        except Exception as error:
+            st.session_state.analysis = {
+                "symbol": symbol,
+                "candles": [],
+                "volume": [],
+                "provider": "setup-error",
+                "sentiment": {"label": "Setup Required", "score": 0, "confidence": 0, "topEvents": []},
+                "technicals": {
+                    "lastPrice": 0,
+                    "rsi": 0,
+                    "vwap": 0,
+                    "macdHistogram": 0,
+                    "trendStrength": 0,
+                    "bias": "Setup Required",
+                },
+                "risk": {"score": 0, "level": "Setup Required"},
+                "confidence": 0,
+                "explanation": f"Startup failed before analysis completed: {str(error)[:180]}",
+                "aiMode": "Setup Required",
+                "analyzed": [],
+                "setupError": True,
+            }
 
 analysis = st.session_state.analysis
 st.caption(f"LIVE DATA ({analysis['provider']}) | STOCKTWITS SOCIAL | {analysis['aiMode'].upper()} AI")
 
 if analysis.get("setupError"):
-    st.error("Missing Alpaca credentials in Streamlit Cloud Secrets.")
+    st.error(analysis["explanation"])
     st.code(STREAMLIT_SECRETS_TEMPLATE, language="toml")
     st.stop()
 
