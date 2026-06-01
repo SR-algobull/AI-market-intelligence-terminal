@@ -119,6 +119,10 @@ def secret(name, default=""):
 
 
 DEFAULT_HEADERS = {"User-Agent": "ai-market-intelligence-terminal/1.0"}
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
 
 
 def get_json(url, headers=None, params=None, timeout=20):
@@ -277,7 +281,7 @@ def fetch_yahoo_chart(symbol, range_name, interval):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"range": range_name, "interval": interval, "includePrePost": "false", "events": "div,splits"}
     try:
-        result = get_json(url, params=params, timeout=25)["chart"]["result"][0]
+        result = get_json(url, headers=YAHOO_HEADERS, params=params, timeout=25)["chart"]["result"][0]
         timestamps = result.get("timestamp", [])
         quote = result.get("indicators", {}).get("quote", [{}])[0]
         closes = quote.get("close", [])
@@ -306,7 +310,7 @@ def fetch_chart_ranges(symbol, fallback_candles, fallback_volume):
     ranges = {
         "1D": fetch_yahoo_chart(symbol, "1d", "5m"),
         "1M": fetch_yahoo_chart(symbol, "1mo", "1d"),
-        "1Y": fetch_yahoo_chart(symbol, "1y", "1wk"),
+        "1Y": fetch_yahoo_chart(symbol, "1y", "1d"),
         "5Y": fetch_yahoo_chart(symbol, "5y", "1mo"),
     }
     if not ranges["1M"]:
@@ -316,6 +320,16 @@ def fetch_chart_ranges(symbol, fallback_candles, fallback_volume):
             for index, price in enumerate(fallback_candles)
         ]
     return ranges
+
+
+def fetch_yahoo_market_snapshot(symbol):
+    rows = fetch_yahoo_chart(symbol, "1mo", "1d")
+    if not rows:
+        return None, None, "missing-yahoo-market-data"
+    recent = rows[-24:]
+    candles = [row["close"] for row in recent]
+    volume = [row["volume"] for row in recent]
+    return candles, volume, "yahoo"
 
 
 def demo_market(symbol):
@@ -642,7 +656,9 @@ def analyze(symbol):
     candles, volume, provider = fetch_alpaca(symbol)
     if not candles or not volume:
         provider_status = provider
-        candles, volume, provider = demo_market(symbol)
+        candles, volume, provider = fetch_yahoo_market_snapshot(symbol)
+        if not candles or not volume:
+            candles, volume, provider = demo_market(symbol)
     else:
         provider_status = None
 
@@ -800,6 +816,7 @@ with st.expander("Decision Overview", expanded=True):
     st.write(analysis["explanation"])
 
 with st.expander("Price + Volume Chart", expanded=True):
+    st.caption("Chart ranges use Yahoo public chart data when available. Core live analysis uses Alpaca first, then Yahoo fallback, then demo fallback.")
     chart_tabs = st.tabs(["1D", "1M", "1Y", "5Y"])
     for tab, range_name in zip(chart_tabs, ["1D", "1M", "1Y", "5Y"]):
         with tab:
