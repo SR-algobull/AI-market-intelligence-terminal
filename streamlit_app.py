@@ -111,6 +111,20 @@ DEMO_TEXT = [
     },
 ]
 
+SP500_FALLBACK_SYMBOLS = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "BRK-B", "LLY", "AVGO",
+    "JPM", "TSLA", "XOM", "UNH", "V", "MA", "COST", "WMT", "PG", "JNJ",
+    "HD", "ABBV", "BAC", "KO", "NFLX", "CRM", "AMD", "PEP", "TMO", "LIN",
+    "CSCO", "ACN", "MCD", "ORCL", "WFC", "ABT", "GE", "INTU", "DIS", "IBM",
+]
+
+NASDAQ100_FALLBACK_SYMBOLS = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "AVGO", "GOOGL", "GOOG", "TSLA", "COST",
+    "NFLX", "AMD", "PEP", "ADBE", "CSCO", "TMUS", "INTU", "QCOM", "AMAT", "TXN",
+    "AMGN", "HON", "CMCSA", "ISRG", "BKNG", "LRCX", "SBUX", "GILD", "ADP", "MDLZ",
+    "PANW", "MU", "ADI", "MELI", "KLAC", "SNPS", "CDNS", "MAR", "REGN", "CRWD",
+]
+
 def secret(name, default=""):
     try:
         return st.secrets.get(name, os.getenv(name, default))
@@ -339,21 +353,29 @@ def yahoo_symbol(symbol):
 @st.cache_data(ttl=24 * 60 * 60)
 def fetch_sp500_symbols():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
-    symbols = tables[0]["Symbol"].astype(str).tolist()
-    return [symbol.strip() for symbol in symbols if symbol.strip()]
+    try:
+        html = requests.get(url, headers=YAHOO_HEADERS, timeout=20).text
+        tables = pd.read_html(html)
+        symbols = tables[0]["Symbol"].astype(str).tolist()
+        return [symbol.strip() for symbol in symbols if symbol.strip()]
+    except Exception:
+        return SP500_FALLBACK_SYMBOLS
 
 
 @st.cache_data(ttl=24 * 60 * 60)
 def fetch_nasdaq100_symbols():
     url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-    tables = pd.read_html(url)
-    for table in tables:
-        for column in table.columns:
-            if str(column).lower() in {"ticker", "symbol"}:
-                symbols = table[column].astype(str).tolist()
-                return [symbol.strip() for symbol in symbols if symbol.strip() and symbol.strip().lower() != "nan"]
-    return []
+    try:
+        html = requests.get(url, headers=YAHOO_HEADERS, timeout=20).text
+        tables = pd.read_html(html)
+        for table in tables:
+            for column in table.columns:
+                if str(column).lower() in {"ticker", "symbol"}:
+                    symbols = table[column].astype(str).tolist()
+                    return [symbol.strip() for symbol in symbols if symbol.strip() and symbol.strip().lower() != "nan"]
+    except Exception:
+        return NASDAQ100_FALLBACK_SYMBOLS
+    return NASDAQ100_FALLBACK_SYMBOLS
 
 
 def screen_52w_drawdowns(symbols, threshold_pct=15, max_symbols=None):
