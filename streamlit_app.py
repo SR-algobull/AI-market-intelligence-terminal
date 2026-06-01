@@ -273,6 +273,51 @@ def fetch_stocktwits(symbol):
     ]
 
 
+def fetch_yahoo_chart(symbol, range_name, interval):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": range_name, "interval": interval, "includePrePost": "false", "events": "div,splits"}
+    try:
+        result = get_json(url, params=params, timeout=25)["chart"]["result"][0]
+        timestamps = result.get("timestamp", [])
+        quote = result.get("indicators", {}).get("quote", [{}])[0]
+        closes = quote.get("close", [])
+        highs = quote.get("high", [])
+        volumes = quote.get("volume", [])
+    except Exception:
+        return []
+
+    rows = []
+    for index, timestamp in enumerate(timestamps):
+        close = closes[index] if index < len(closes) else None
+        if close is None:
+            continue
+        rows.append(
+            {
+                "time": datetime.fromtimestamp(timestamp, timezone.utc),
+                "close": round(float(close), 4),
+                "high": round(float(highs[index]), 4) if index < len(highs) and highs[index] is not None else round(float(close), 4),
+                "volume": (volumes[index] or 0) / 1_000_000 if index < len(volumes) else 0,
+            }
+        )
+    return rows
+
+
+def fetch_chart_ranges(symbol, fallback_candles, fallback_volume):
+    ranges = {
+        "1D": fetch_yahoo_chart(symbol, "1d", "5m"),
+        "1M": fetch_yahoo_chart(symbol, "1mo", "1d"),
+        "1Y": fetch_yahoo_chart(symbol, "1y", "1wk"),
+        "5Y": fetch_yahoo_chart(symbol, "5y", "1mo"),
+    }
+    if not ranges["1M"]:
+        now = datetime.now(timezone.utc)
+        ranges["1M"] = [
+            {"time": now - timedelta(days=len(fallback_candles) - index), "close": price, "high": price, "volume": fallback_volume[index]}
+            for index, price in enumerate(fallback_candles)
+        ]
+    return ranges
+
+
 def demo_market(symbol):
     market = DEMO_MARKET.get(symbol, DEMO_MARKET["NVDA"])
     return market["candles"], market["volume"], "demo"
@@ -447,6 +492,43 @@ def key_levels(candles, tech):
     }
 
 
+def week_52_position(charts, current_price):
+    one_year = charts.get("1Y", [])
+    highs = [row["high"] for row in one_year if row.get("high")]
+    closes = [row["close"] for row in one_year if row.get("close")]
+    if not highs:
+        highs = closes or [current_price]
+    high_52 = max(highs)
+    low_52 = min(closes or highs)
+    distance_from_high = ((current_price - high_52) / high_52) if high_52 else 0
+    drawdown_pct = abs(min(0, distance_from_high)) * 100
+    range_position = ((current_price - low_52) / (high_52 - low_52)) if high_52 != low_52 else 1
+
+    if drawdown_pct <= 3:
+        label = "Near 52-week high"
+        explanation = "The stock is trading close to its 52-week high, so breakout continuation and overbought risk both matter."
+    elif drawdown_pct <= 10:
+        label = "Within striking distance"
+        explanation = "The stock is below its 52-week high but still close enough that resistance and prior highs may influence behavior."
+    elif drawdown_pct <= 25:
+        label = "Moderate discount"
+        explanation = "The stock is meaningfully below its 52-week high, which can reduce overbought pressure but may also reflect weaker momentum."
+    else:
+        label = "Deep drawdown"
+        explanation = "The stock is far below its 52-week high, so recovery potential must be weighed against possible structural weakness."
+
+    return {
+        "high": round(high_52, 2),
+        "low": round(low_52, 2),
+        "current": round(current_price, 2),
+        "distancePct": round(distance_from_high * 100, 2),
+        "drawdownPct": round(drawdown_pct, 2),
+        "rangePositionPct": round(max(0, min(1, range_position)) * 100, 2),
+        "label": label,
+        "explanation": explanation,
+    }
+
+
 def irrationality_gauge(analyzed_items, sentiment, tech, risk, volume_view):
     if not analyzed_items:
         return {
@@ -520,7 +602,7 @@ def risk_score(candles, sentiment):
     return {"score": round(score, 2), "level": "High" if score > 0.68 else "Moderate" if score > 0.42 else "Low"}
 
 
-def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, overbought, levels, confidence, items):
+def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, overbought, levels, week_52, confidence, items):
     api_key = secret("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -538,8 +620,9 @@ def openai_explanation(symbol, tech, sentiment, risk, volume, irrationality, ove
             f"Market irrationality gauge: {irrationality['level']} ({irrationality['score']}) | {irrationality['label']} | {irrationality['explanation']}\n"
             f"Overbought indicator: {overbought['level']} ({overbought['score']}) | {overbought['label']} | RSI {overbought['rsi']} | VWAP extension {overbought['vwapExtensionPct']}% | {overbought['explanation']}\n"
             f"Key levels: {levels['status']} | current {levels['current']} | support {levels['nearestSupport']} ({levels['supportDistancePct']}% away) | resistance {levels['nearestResistance']} ({levels['resistanceDistancePct']}% away) | {levels['explanation']}\n"
+            f"52-week position: current {week_52['current']} | high {week_52['high']} | distance from high {week_52['distancePct']}% | range position {week_52['rangePositionPct']}% | {week_52['explanation']}\n"
             f"Recent text:\n{headlines}\n"
-            "Return exactly six sentences: setup, key levels, MACD significance, overbought read, irrationality/overreaction read, then main risk."
+            "Return exactly seven sentences: setup, 52-week context, key levels, MACD significance, overbought read, irrationality/overreaction read, then main risk."
         ),
     }
     response = requests.post(
@@ -563,6 +646,7 @@ def analyze(symbol):
     else:
         provider_status = None
 
+    charts = fetch_chart_ranges(symbol, candles, volume)
     text_items = fetch_finnhub_news(symbol) + fetch_stocktwits(symbol)
     if not text_items:
         text_items = DEMO_TEXT
@@ -571,6 +655,7 @@ def analyze(symbol):
     tech = technicals(candles, volume)
     tech["macdSignificance"] = macd_significance(tech["macdHistogram"], tech["bias"])
     levels = key_levels(candles, tech)
+    week_52 = week_52_position(charts, tech["lastPrice"])
     volume_view = volume_analysis(candles, volume)
     overbought = overbought_indicator(tech, volume_view)
     risk = risk_score(candles, sentiment)
@@ -581,12 +666,13 @@ def analyze(symbol):
     level_adjustment = 0.04 if levels["status"] == "Breakout" else -0.05 if levels["status"] in {"Breakdown", "Near resistance"} else 0
     confidence = max(0, min(1, ((tech["trendStrength"] + 1) / 2) * 0.38 + ((sentiment["score"] + 1) / 2) * 0.34 + volume_boost + level_adjustment - risk["score"] * 0.2 - irrationality_penalty - overbought_penalty + 0.16))
     try:
-        explanation = openai_explanation(symbol, tech, sentiment, risk, volume_view, irrationality, overbought, levels, confidence, analyzed)
+        explanation = openai_explanation(symbol, tech, sentiment, risk, volume_view, irrationality, overbought, levels, week_52, confidence, analyzed)
         ai_mode = "OpenAI"
     except Exception as error:
         explanation = (
             f"{symbol} has a {round(confidence * 100)}% trade confidence score because {tech['bias'].lower()} "
             f"and {sentiment['label'].lower()} NLP sentiment are being weighed against {risk['level'].lower()} risk. "
+            f"It is {week_52['distancePct']}% from its 52-week high. "
             f"Key levels status: {levels['status'].lower()}. "
             f"{tech['macdSignificance']} Volume is classified as {volume_view['label'].lower()}: {volume_view['explanation']} "
             f"Overbought indicator: {overbought['label'].lower()}. Irrationality gauge: {irrationality['label'].lower()}."
@@ -596,10 +682,12 @@ def analyze(symbol):
         "symbol": symbol,
         "candles": candles,
         "volume": volume,
+        "charts": charts,
         "provider": provider,
         "sentiment": sentiment,
         "technicals": tech,
         "keyLevels": levels,
+        "week52": week_52,
         "volumeAnalysis": volume_view,
         "overbought": overbought,
         "irrationality": irrationality,
@@ -624,6 +712,7 @@ if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
                 "symbol": symbol,
                 "candles": [],
                 "volume": [],
+                "charts": {"1D": [], "1M": [], "1Y": [], "5Y": []},
                 "provider": "setup-error",
                 "sentiment": {"label": "Setup Required", "score": 0, "confidence": 0, "topEvents": []},
                 "technicals": {
@@ -645,6 +734,16 @@ if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
                     "recentHigh": 0,
                     "recentLow": 0,
                     "vwap": 0,
+                    "explanation": "Setup required.",
+                },
+                "week52": {
+                    "high": 0,
+                    "low": 0,
+                    "current": 0,
+                    "distancePct": 0,
+                    "drawdownPct": 0,
+                    "rangePositionPct": 0,
+                    "label": "Setup Required",
                     "explanation": "Setup required.",
                 },
                 "volumeAnalysis": {
@@ -701,10 +800,24 @@ with st.expander("Decision Overview", expanded=True):
     st.write(analysis["explanation"])
 
 with st.expander("Price + Volume Chart", expanded=True):
-    chart_df = pd.DataFrame({"day": range(len(analysis["candles"])), "price": analysis["candles"], "volume": analysis["volume"]})
-    line = alt.Chart(chart_df).mark_line(point=True).encode(x="day", y=alt.Y("price", scale=alt.Scale(zero=False)))
-    bars = alt.Chart(chart_df).mark_bar(opacity=0.25).encode(x="day", y="volume")
-    st.altair_chart(line | bars, use_container_width=True)
+    chart_tabs = st.tabs(["1D", "1M", "1Y", "5Y"])
+    for tab, range_name in zip(chart_tabs, ["1D", "1M", "1Y", "5Y"]):
+        with tab:
+            rows = analysis["charts"].get(range_name, [])
+            if rows:
+                chart_df = pd.DataFrame(rows)
+                line = alt.Chart(chart_df).mark_line(point=True).encode(
+                    x=alt.X("time:T", title="Time"),
+                    y=alt.Y("close:Q", title="Price", scale=alt.Scale(zero=False)),
+                    tooltip=["time:T", "close:Q", "volume:Q"],
+                )
+                bars = alt.Chart(chart_df).mark_bar(opacity=0.25).encode(
+                    x=alt.X("time:T", title="Time"),
+                    y=alt.Y("volume:Q", title="Volume (M)"),
+                )
+                st.altair_chart(line | bars, use_container_width=True)
+            else:
+                st.info(f"{range_name} chart data is temporarily unavailable.")
 
 with st.expander("Technical Indicators", expanded=False):
     metrics = st.columns(4)
@@ -723,6 +836,16 @@ with st.expander("Key Levels", expanded=True):
     level_cols[3].metric("VWAP", f"${levels['vwap']}")
     st.write(levels["explanation"])
     st.write(f"Recent high: ${levels['recentHigh']} | Recent low: ${levels['recentLow']} | Current: ${levels['current']}")
+
+with st.expander("52-Week High Distance", expanded=True):
+    week_52 = analysis["week52"]
+    week_cols = st.columns(4)
+    week_cols[0].metric("52W High", f"${week_52['high']}")
+    week_cols[1].metric("Distance From High", f"{week_52['distancePct']}%")
+    week_cols[2].metric("52W Low", f"${week_52['low']}")
+    week_cols[3].metric("Range Position", f"{week_52['rangePositionPct']}%")
+    st.markdown(f"**{week_52['label']}**")
+    st.write(week_52["explanation"])
 
 with st.expander("Volume Analysis", expanded=True):
     volume_view = analysis["volumeAnalysis"]
