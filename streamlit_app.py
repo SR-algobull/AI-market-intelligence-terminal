@@ -332,6 +332,59 @@ def fetch_yahoo_market_snapshot(symbol):
     return candles, volume, "yahoo"
 
 
+def yahoo_symbol(symbol):
+    return symbol.replace(".", "-")
+
+
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_sp500_symbols():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    tables = pd.read_html(url)
+    symbols = tables[0]["Symbol"].astype(str).tolist()
+    return [symbol.strip() for symbol in symbols if symbol.strip()]
+
+
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_nasdaq100_symbols():
+    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+    tables = pd.read_html(url)
+    for table in tables:
+        for column in table.columns:
+            if str(column).lower() in {"ticker", "symbol"}:
+                symbols = table[column].astype(str).tolist()
+                return [symbol.strip() for symbol in symbols if symbol.strip() and symbol.strip().lower() != "nan"]
+    return []
+
+
+def screen_52w_drawdowns(symbols, threshold_pct=15, max_symbols=None):
+    selected_symbols = symbols[:max_symbols] if max_symbols else symbols
+    results = []
+    progress = st.progress(0, text="Scanning 52-week highs...")
+
+    for index, symbol in enumerate(selected_symbols):
+        rows = fetch_yahoo_chart(yahoo_symbol(symbol), "1y", "1d")
+        if rows:
+            current = rows[-1]["close"]
+            high_52 = max(row["high"] for row in rows if row.get("high"))
+            low_52 = min(row["close"] for row in rows if row.get("close"))
+            distance_pct = ((current - high_52) / high_52) * 100 if high_52 else 0
+            if distance_pct <= -threshold_pct:
+                results.append(
+                    {
+                        "Symbol": symbol,
+                        "Current": round(current, 2),
+                        "52W High": round(high_52, 2),
+                        "52W Low": round(low_52, 2),
+                        "% From 52W High": round(distance_pct, 2),
+                        "Drawdown %": round(abs(distance_pct), 2),
+                    }
+                )
+        progress.progress((index + 1) / max(1, len(selected_symbols)), text=f"Scanned {index + 1}/{len(selected_symbols)}")
+
+    progress.empty()
+    return sorted(results, key=lambda row: row["Drawdown %"], reverse=True)
+
+
 def demo_market(symbol):
     market = DEMO_MARKET.get(symbol, DEMO_MARKET["NVDA"])
     return market["candles"], market["volume"], "demo"
@@ -714,6 +767,51 @@ def analyze(symbol):
         "analyzed": analyzed,
         "providerStatus": provider_status,
     }
+
+
+page = st.sidebar.radio("Page", ["Market Intelligence Terminal", "52-Week Drawdown Screener"])
+
+if page == "52-Week Drawdown Screener":
+    st.title("52-Week Drawdown Screener")
+    st.caption("Find S&P 500 and Nasdaq-100 stocks trading at least 15% below their 52-week high.")
+
+    universe = st.selectbox("Universe", ["S&P 500", "Nasdaq-100", "S&P 500 + Nasdaq-100"])
+    threshold = st.slider("Minimum drawdown from 52-week high", 5, 60, 15, 1)
+    max_symbols = st.number_input(
+        "Max symbols to scan",
+        min_value=25,
+        max_value=650,
+        value=150,
+        step=25,
+        help="Higher values scan more names but can take longer on Streamlit Cloud.",
+    )
+
+    if universe == "S&P 500":
+        symbols = fetch_sp500_symbols()
+    elif universe == "Nasdaq-100":
+        symbols = fetch_nasdaq100_symbols()
+    else:
+        symbols = sorted(set(fetch_sp500_symbols() + fetch_nasdaq100_symbols()))
+
+    st.write(f"Universe size: {len(symbols)} symbols")
+    st.info("The scan uses Yahoo public chart data and may take a minute for larger universes.")
+
+    if st.button("Run Screener", type="primary"):
+        results = screen_52w_drawdowns(symbols, threshold_pct=threshold, max_symbols=int(max_symbols))
+        st.subheader(f"Stocks at least {threshold}% below 52-week high")
+        if results:
+            result_df = pd.DataFrame(results)
+            st.dataframe(result_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download CSV",
+                result_df.to_csv(index=False),
+                file_name=f"drawdown_screener_{threshold}pct.csv",
+                mime="text/csv",
+            )
+        else:
+            st.success("No stocks matched the selected threshold in the scanned set.")
+
+    st.stop()
 
 
 st.title("AI Market Intelligence Terminal")
