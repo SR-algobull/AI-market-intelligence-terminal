@@ -553,10 +553,11 @@ def suggested_trade_metrics(symbol, include_nlp=False):
     else:
         recommendation = "Neutral - Wait"
 
+    rr = risk_reward_profile(side, tech["lastPrice"], levels)
     rationale = (
         f"{side} bias. {trade_type}: {tech['bias']}; key levels are {levels['status'].lower()}; "
         f"volume is {volume_view['label'].lower()}; overbought risk is {overbought['level'].lower()}; "
-        f"risk is {risk['level'].lower()}."
+        f"risk is {risk['level'].lower()}; risk/reward is {rr['ratioLabel']}."
     )
 
     return {
@@ -568,8 +569,11 @@ def suggested_trade_metrics(symbol, include_nlp=False):
         "Current": round(tech["lastPrice"], 2),
         "Support": levels["nearestSupport"],
         "Resistance": levels["nearestResistance"],
-        "Stop Context": levels["nearestSupport"],
-        "Target Context": levels["nearestResistance"],
+        "Risk/Reward": rr["ratioLabel"],
+        "Reward %": rr["rewardPct"],
+        "Risk %": rr["riskPct"],
+        "Stop Context": rr["stop"],
+        "Target Context": rr["target"],
         "Trend": tech["bias"],
         "MACD Hist": tech["macdHistogram"],
         "Volume": volume_view["label"],
@@ -595,6 +599,41 @@ def screen_suggested_trades(symbols, min_score=58, max_symbols=None, include_nlp
 
     progress.empty()
     return sorted(results, key=lambda row: row["Score"], reverse=True)
+
+
+def risk_reward_profile(side, current_price, levels):
+    support = levels["nearestSupport"]
+    resistance = levels["nearestResistance"]
+    recent_range = max(0.01, levels["recentHigh"] - levels["recentLow"])
+
+    if side == "Bearish":
+        stop = resistance if resistance > current_price else current_price + recent_range * 0.5
+        target = support if support < current_price else current_price - recent_range
+    else:
+        stop = support if support < current_price else current_price - recent_range * 0.5
+        target = resistance if resistance > current_price else current_price + recent_range
+
+    risk = abs(current_price - stop)
+    reward = abs(target - current_price)
+    ratio = reward / risk if risk else 0
+
+    if ratio >= 2:
+        label = f"{ratio:.2f}:1 favorable"
+    elif ratio >= 1:
+        label = f"{ratio:.2f}:1 balanced"
+    elif ratio > 0:
+        label = f"{ratio:.2f}:1 weak"
+    else:
+        label = "N/A"
+
+    return {
+        "ratio": round(ratio, 2),
+        "ratioLabel": label,
+        "riskPct": round((risk / current_price) * 100, 2) if current_price else 0,
+        "rewardPct": round((reward / current_price) * 100, 2) if current_price else 0,
+        "stop": round(stop, 2),
+        "target": round(target, 2),
+    }
 
 
 def demo_market(symbol):
@@ -1104,9 +1143,10 @@ if page == "Suggested Trades":
     st.write(f"Universe size: {len(symbols)} symbols")
     st.info(
         "Trade score blends trend, support/resistance, 52-week position, volume participation, overbought risk, "
-        "market irrationality, and risk. Enable NLP for richer but slower scans."
+        "market irrationality, risk, and risk/reward context. Enable NLP for richer but slower scans."
     )
     st.caption("Side meanings: Bullish = long/watchlist bias, Bearish = avoid long or downside-risk bias, Neutral = wait for confirmation.")
+    st.caption("Risk/reward is a metric only: it estimates reward to target versus risk to stop using nearby key levels.")
 
     if st.button("Generate Suggested Trades", type="primary"):
         results = screen_suggested_trades(
