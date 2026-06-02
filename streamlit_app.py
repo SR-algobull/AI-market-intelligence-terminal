@@ -325,6 +325,7 @@ def fetch_chart_ranges(symbol, fallback_candles, fallback_volume):
         "1D": fetch_yahoo_chart(symbol, "1d", "5m"),
         "1M": fetch_yahoo_chart(symbol, "1mo", "1d"),
         "1Y": fetch_yahoo_chart(symbol, "1y", "1d"),
+        "3Y": fetch_yahoo_chart(symbol, "3y", "1wk"),
         "5Y": fetch_yahoo_chart(symbol, "5y", "1mo"),
     }
     if not ranges["1M"]:
@@ -1183,7 +1184,7 @@ if st.button("Analyze", type="primary") or "analysis" not in st.session_state:
                 "symbol": symbol,
                 "candles": [],
                 "volume": [],
-                "charts": {"1D": [], "1M": [], "1Y": [], "5Y": []},
+                "charts": {"1D": [], "1M": [], "1Y": [], "3Y": [], "5Y": []},
                 "provider": "setup-error",
                 "sentiment": {"label": "Setup Required", "score": 0, "confidence": 0, "topEvents": []},
                 "technicals": {
@@ -1272,8 +1273,8 @@ with st.expander("Decision Overview", expanded=True):
 
 with st.expander("Price + Volume Chart", expanded=True):
     st.caption("Chart ranges use Yahoo public chart data when available. Core live analysis uses Alpaca first, then Yahoo fallback, then demo fallback.")
-    chart_tabs = st.tabs(["1D", "1M", "1Y", "5Y"])
-    for tab, range_name in zip(chart_tabs, ["1D", "1M", "1Y", "5Y"]):
+    chart_tabs = st.tabs(["1D", "1M", "1Y", "3Y", "5Y"])
+    for tab, range_name in zip(chart_tabs, ["1D", "1M", "1Y", "3Y", "5Y"]):
         with tab:
             rows = analysis["charts"].get(range_name, [])
             if rows:
