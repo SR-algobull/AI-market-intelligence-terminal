@@ -529,33 +529,39 @@ def suggested_trade_metrics(symbol, include_nlp=False):
     score = max(0, min(100, trend_points + sentiment_points + volume_points + level_points + week_52_points - overbought_penalty - risk_penalty - irrationality_penalty + 35))
 
     if levels["status"] == "Breakout" and volume_view["label"] in {"Bullish accumulation", "Participation increasing"} and overbought["level"] != "High":
+        side = "Bullish"
         trade_type = "Breakout long watch"
     elif levels["status"] == "Near support" and risk["level"] != "High":
+        side = "Bullish"
         trade_type = "Support bounce watch"
     elif tech["bias"] == "Bullish Momentum" and levels["status"] != "Near resistance" and overbought["level"] != "High":
+        side = "Bullish"
         trade_type = "Momentum continuation watch"
     elif levels["status"] == "Breakdown" or risk["level"] == "High":
-        trade_type = "Avoid / downside risk"
+        side = "Bearish"
+        trade_type = "Downside risk / avoid long"
     else:
+        side = "Neutral"
         trade_type = "Wait for confirmation"
 
-    if score >= 72 and trade_type != "Avoid / downside risk":
-        recommendation = "Strong watch"
-    elif score >= 58 and trade_type != "Avoid / downside risk":
-        recommendation = "Watch"
-    elif trade_type == "Avoid / downside risk":
-        recommendation = "Avoid"
+    if score >= 72 and side == "Bullish":
+        recommendation = "Bullish - Strong Watch"
+    elif score >= 58 and side == "Bullish":
+        recommendation = "Bullish - Watch"
+    elif side == "Bearish":
+        recommendation = "Bearish - Avoid Long"
     else:
-        recommendation = "Wait"
+        recommendation = "Neutral - Wait"
 
     rationale = (
-        f"{trade_type}: {tech['bias']}; key levels are {levels['status'].lower()}; "
+        f"{side} bias. {trade_type}: {tech['bias']}; key levels are {levels['status'].lower()}; "
         f"volume is {volume_view['label'].lower()}; overbought risk is {overbought['level'].lower()}; "
         f"risk is {risk['level'].lower()}."
     )
 
     return {
         "Symbol": symbol,
+        "Side": side,
         "Recommendation": recommendation,
         "Trade Type": trade_type,
         "Score": round(score, 1),
@@ -1100,6 +1106,7 @@ if page == "Suggested Trades":
         "Trade score blends trend, support/resistance, 52-week position, volume participation, overbought risk, "
         "market irrationality, and risk. Enable NLP for richer but slower scans."
     )
+    st.caption("Side meanings: Bullish = long/watchlist bias, Bearish = avoid long or downside-risk bias, Neutral = wait for confirmation.")
 
     if st.button("Generate Suggested Trades", type="primary"):
         results = screen_suggested_trades(
