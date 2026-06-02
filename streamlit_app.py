@@ -474,6 +474,123 @@ def screen_consolidation(symbols, min_score=55, max_symbols=None):
     return sorted(results, key=lambda row: row["Consolidation Score"], reverse=True)
 
 
+def neutral_sentiment():
+    return {"label": "Neutral", "score": 0, "confidence": 0.4, "topEvents": []}
+
+
+def suggested_trade_metrics(symbol, include_nlp=False):
+    rows = fetch_yahoo_chart(yahoo_symbol(symbol), "1y", "1d")
+    if len(rows) < 30:
+        return None
+
+    recent = rows[-24:]
+    candles = [row["close"] for row in recent]
+    volume = [row["volume"] for row in recent]
+    if len(candles) < 20 or not all(candles):
+        return None
+
+    analyzed = []
+    sentiment = neutral_sentiment()
+    if include_nlp:
+        text_items = fetch_finnhub_news(symbol) + fetch_stocktwits(symbol)
+        analyzed = analyze_text(text_items)
+        sentiment = aggregate_sentiment(analyzed)
+
+    tech = technicals(candles, volume)
+    tech["macdSignificance"] = macd_significance(tech["macdHistogram"], tech["bias"])
+    levels = key_levels(candles, tech)
+    charts = {"1Y": rows}
+    week_52 = week_52_position(charts, tech["lastPrice"])
+    volume_view = volume_analysis(candles, volume)
+    overbought = overbought_indicator(tech, volume_view)
+    risk = risk_score(candles, sentiment)
+    irrationality = irrationality_gauge(analyzed, sentiment, tech, risk, volume_view) if include_nlp else {
+        "score": 0,
+        "level": "Low",
+        "label": "Not evaluated",
+        "explanation": "NLP was not included in this scan.",
+        "drivers": [],
+    }
+
+    trend_points = ((tech["trendStrength"] + 1) / 2) * 25
+    sentiment_points = ((sentiment["score"] + 1) / 2) * 18 if include_nlp else 9
+    volume_points = 9 if volume_view["label"] in {"Bullish accumulation", "Participation increasing"} else -8 if volume_view["label"] == "Distribution pressure" else 1
+    level_points = {
+        "Breakout": 13,
+        "Near support": 7,
+        "Between levels": 2,
+        "Near resistance": -7,
+        "Breakdown": -13,
+    }.get(levels["status"], 0)
+    week_52_points = 5 if week_52["drawdownPct"] <= 10 else 2 if week_52["drawdownPct"] <= 25 else -4
+    overbought_penalty = overbought["score"] * 10
+    risk_penalty = risk["score"] * 15
+    irrationality_penalty = irrationality["score"] * 8
+    score = max(0, min(100, trend_points + sentiment_points + volume_points + level_points + week_52_points - overbought_penalty - risk_penalty - irrationality_penalty + 35))
+
+    if levels["status"] == "Breakout" and volume_view["label"] in {"Bullish accumulation", "Participation increasing"} and overbought["level"] != "High":
+        trade_type = "Breakout long watch"
+    elif levels["status"] == "Near support" and risk["level"] != "High":
+        trade_type = "Support bounce watch"
+    elif tech["bias"] == "Bullish Momentum" and levels["status"] != "Near resistance" and overbought["level"] != "High":
+        trade_type = "Momentum continuation watch"
+    elif levels["status"] == "Breakdown" or risk["level"] == "High":
+        trade_type = "Avoid / downside risk"
+    else:
+        trade_type = "Wait for confirmation"
+
+    if score >= 72 and trade_type != "Avoid / downside risk":
+        recommendation = "Strong watch"
+    elif score >= 58 and trade_type != "Avoid / downside risk":
+        recommendation = "Watch"
+    elif trade_type == "Avoid / downside risk":
+        recommendation = "Avoid"
+    else:
+        recommendation = "Wait"
+
+    rationale = (
+        f"{trade_type}: {tech['bias']}; key levels are {levels['status'].lower()}; "
+        f"volume is {volume_view['label'].lower()}; overbought risk is {overbought['level'].lower()}; "
+        f"risk is {risk['level'].lower()}."
+    )
+
+    return {
+        "Symbol": symbol,
+        "Recommendation": recommendation,
+        "Trade Type": trade_type,
+        "Score": round(score, 1),
+        "Current": round(tech["lastPrice"], 2),
+        "Support": levels["nearestSupport"],
+        "Resistance": levels["nearestResistance"],
+        "Stop Context": levels["nearestSupport"],
+        "Target Context": levels["nearestResistance"],
+        "Trend": tech["bias"],
+        "MACD Hist": tech["macdHistogram"],
+        "Volume": volume_view["label"],
+        "Overbought": overbought["level"],
+        "Risk": risk["level"],
+        "52W Drawdown %": week_52["drawdownPct"],
+        "Irrationality": irrationality["level"],
+        "Sentiment": sentiment["label"],
+        "Rationale": rationale,
+    }
+
+
+def screen_suggested_trades(symbols, min_score=58, max_symbols=None, include_nlp=False):
+    selected_symbols = symbols[:max_symbols] if max_symbols else symbols
+    results = []
+    progress = st.progress(0, text="Scoring trade candidates...")
+
+    for index, symbol in enumerate(selected_symbols):
+        metrics = suggested_trade_metrics(symbol, include_nlp=include_nlp)
+        if metrics and metrics["Score"] >= min_score:
+            results.append(metrics)
+        progress.progress((index + 1) / max(1, len(selected_symbols)), text=f"Scored {index + 1}/{len(selected_symbols)}")
+
+    progress.empty()
+    return sorted(results, key=lambda row: row["Score"], reverse=True)
+
+
 def demo_market(symbol):
     market = DEMO_MARKET.get(symbol, DEMO_MARKET["NVDA"])
     return market["candles"], market["volume"], "demo"
@@ -858,7 +975,10 @@ def analyze(symbol):
     }
 
 
-page = st.sidebar.radio("Page", ["Market Intelligence Terminal", "52-Week Drawdown Screener", "Consolidation Screener"])
+page = st.sidebar.radio(
+    "Page",
+    ["Market Intelligence Terminal", "52-Week Drawdown Screener", "Consolidation Screener", "Suggested Trades"],
+)
 
 if page == "52-Week Drawdown Screener":
     st.title("52-Week Drawdown Screener")
@@ -946,6 +1066,60 @@ if page == "Consolidation Screener":
             )
         else:
             st.success("No stocks matched the selected consolidation threshold in the scanned set.")
+
+    st.stop()
+
+
+if page == "Suggested Trades":
+    st.title("Suggested Trades")
+    st.caption("Rank trade candidates using trend, key levels, volume, 52-week context, overbought risk, risk scoring, and optional NLP.")
+    st.warning("Educational research only. These are watchlist ideas, not financial advice or executable trade instructions.")
+
+    universe = st.selectbox("Universe", ["S&P 500", "Nasdaq-100", "S&P 500 + Nasdaq-100"], key="suggested_universe")
+    min_score = st.slider("Minimum trade score", 40, 95, 58, 1)
+    max_symbols = st.number_input(
+        "Max symbols to score",
+        min_value=25,
+        max_value=650,
+        value=100,
+        step=25,
+        key="suggested_max_symbols",
+        help="Higher values scan more names but can take longer. Optional NLP is slower.",
+    )
+    include_nlp = st.checkbox("Include live NLP sentiment in scan", value=False, help="Slower because it pulls news/social text per symbol.")
+
+    if universe == "S&P 500":
+        symbols = fetch_sp500_symbols()
+    elif universe == "Nasdaq-100":
+        symbols = fetch_nasdaq100_symbols()
+    else:
+        symbols = sorted(set(fetch_sp500_symbols() + fetch_nasdaq100_symbols()))
+
+    st.write(f"Universe size: {len(symbols)} symbols")
+    st.info(
+        "Trade score blends trend, support/resistance, 52-week position, volume participation, overbought risk, "
+        "market irrationality, and risk. Enable NLP for richer but slower scans."
+    )
+
+    if st.button("Generate Suggested Trades", type="primary"):
+        results = screen_suggested_trades(
+            symbols,
+            min_score=min_score,
+            max_symbols=int(max_symbols),
+            include_nlp=include_nlp,
+        )
+        st.subheader(f"Suggested trades with score >= {min_score}")
+        if results:
+            result_df = pd.DataFrame(results)
+            st.dataframe(result_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download CSV",
+                result_df.to_csv(index=False),
+                file_name=f"suggested_trades_{min_score}.csv",
+                mime="text/csv",
+            )
+        else:
+            st.success("No trade candidates matched the selected score threshold.")
 
     st.stop()
 
