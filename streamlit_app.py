@@ -407,6 +407,73 @@ def screen_52w_drawdowns(symbols, threshold_pct=15, max_symbols=None):
     return sorted(results, key=lambda row: row["Drawdown %"], reverse=True)
 
 
+def consolidation_metrics(symbol):
+    rows = fetch_yahoo_chart(yahoo_symbol(symbol), "3mo", "1d")
+    if len(rows) < 25:
+        return None
+
+    recent = rows[-20:]
+    closes = [row["close"] for row in recent if row.get("close")]
+    highs = [row["high"] for row in recent if row.get("high")]
+    volumes = [row["volume"] for row in recent if row.get("volume") is not None]
+    if len(closes) < 15:
+        return None
+
+    current = closes[-1]
+    range_high = max(highs or closes)
+    range_low = min(closes)
+    range_pct = ((range_high - range_low) / current) * 100 if current else 0
+    drift_pct = ((current - closes[0]) / closes[0]) * 100 if closes[0] else 0
+    returns = [(closes[index] - closes[index - 1]) / closes[index - 1] for index in range(1, len(closes)) if closes[index - 1]]
+    avg_return = sum(returns) / len(returns) if returns else 0
+    volatility = math.sqrt(sum((value - avg_return) ** 2 for value in returns) / max(1, len(returns))) * math.sqrt(252) * 100
+    range_position = ((current - range_low) / (range_high - range_low)) if range_high != range_low else 0.5
+    avg_volume = sum(volumes) / max(1, len(volumes))
+    latest_volume_ratio = volumes[-1] / avg_volume if avg_volume else 1
+
+    tight_range_score = max(0, min(1, (12 - range_pct) / 12))
+    low_drift_score = max(0, min(1, (6 - abs(drift_pct)) / 6))
+    low_vol_score = max(0, min(1, (45 - volatility) / 45))
+    midpoint_score = max(0, 1 - abs(range_position - 0.5) * 2)
+    score = tight_range_score * 0.38 + low_drift_score * 0.26 + low_vol_score * 0.22 + midpoint_score * 0.14
+
+    if score >= 0.72:
+        phase = "Strong consolidation"
+    elif score >= 0.55:
+        phase = "Possible consolidation"
+    else:
+        phase = "Not consolidating"
+
+    return {
+        "Symbol": symbol,
+        "Current": round(current, 2),
+        "Phase": phase,
+        "Consolidation Score": round(score * 100, 1),
+        "20D Range %": round(range_pct, 2),
+        "20D Drift %": round(drift_pct, 2),
+        "Annualized Vol %": round(volatility, 2),
+        "Range Position %": round(range_position * 100, 2),
+        "Volume Ratio": round(latest_volume_ratio, 2),
+        "Support": round(range_low, 2),
+        "Resistance": round(range_high, 2),
+    }
+
+
+def screen_consolidation(symbols, min_score=55, max_symbols=None):
+    selected_symbols = symbols[:max_symbols] if max_symbols else symbols
+    results = []
+    progress = st.progress(0, text="Scanning consolidation setups...")
+
+    for index, symbol in enumerate(selected_symbols):
+        metrics = consolidation_metrics(symbol)
+        if metrics and metrics["Consolidation Score"] >= min_score:
+            results.append(metrics)
+        progress.progress((index + 1) / max(1, len(selected_symbols)), text=f"Scanned {index + 1}/{len(selected_symbols)}")
+
+    progress.empty()
+    return sorted(results, key=lambda row: row["Consolidation Score"], reverse=True)
+
+
 def demo_market(symbol):
     market = DEMO_MARKET.get(symbol, DEMO_MARKET["NVDA"])
     return market["candles"], market["volume"], "demo"
@@ -791,7 +858,7 @@ def analyze(symbol):
     }
 
 
-page = st.sidebar.radio("Page", ["Market Intelligence Terminal", "52-Week Drawdown Screener"])
+page = st.sidebar.radio("Page", ["Market Intelligence Terminal", "52-Week Drawdown Screener", "Consolidation Screener"])
 
 if page == "52-Week Drawdown Screener":
     st.title("52-Week Drawdown Screener")
@@ -832,6 +899,53 @@ if page == "52-Week Drawdown Screener":
             )
         else:
             st.success("No stocks matched the selected threshold in the scanned set.")
+
+    st.stop()
+
+
+if page == "Consolidation Screener":
+    st.title("Consolidation Screener")
+    st.caption("Find S&P 500 and Nasdaq-100 stocks trading in compressed, sideways ranges.")
+
+    universe = st.selectbox("Universe", ["S&P 500", "Nasdaq-100", "S&P 500 + Nasdaq-100"], key="consolidation_universe")
+    min_score = st.slider("Minimum consolidation score", 40, 90, 55, 1)
+    max_symbols = st.number_input(
+        "Max symbols to scan",
+        min_value=25,
+        max_value=650,
+        value=150,
+        step=25,
+        key="consolidation_max_symbols",
+        help="Higher values scan more names but can take longer on Streamlit Cloud.",
+    )
+
+    if universe == "S&P 500":
+        symbols = fetch_sp500_symbols()
+    elif universe == "Nasdaq-100":
+        symbols = fetch_nasdaq100_symbols()
+    else:
+        symbols = sorted(set(fetch_sp500_symbols() + fetch_nasdaq100_symbols()))
+
+    st.write(f"Universe size: {len(symbols)} symbols")
+    st.info(
+        "Consolidation score blends 20-day range compression, low directional drift, lower volatility, "
+        "and price position near the middle of the range."
+    )
+
+    if st.button("Run Consolidation Scan", type="primary"):
+        results = screen_consolidation(symbols, min_score=min_score, max_symbols=int(max_symbols))
+        st.subheader(f"Stocks with consolidation score >= {min_score}")
+        if results:
+            result_df = pd.DataFrame(results)
+            st.dataframe(result_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download CSV",
+                result_df.to_csv(index=False),
+                file_name=f"consolidation_screener_{min_score}.csv",
+                mime="text/csv",
+            )
+        else:
+            st.success("No stocks matched the selected consolidation threshold in the scanned set.")
 
     st.stop()
 
