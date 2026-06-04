@@ -637,6 +637,93 @@ def risk_reward_profile(side, current_price, levels):
     }
 
 
+def average_true_range(rows, period=14):
+    recent = rows[-period:]
+    ranges = [
+        max(
+            row.get("high") or row.get("close") or 0,
+            row.get("close") or 0,
+        )
+        - min(
+            row.get("low") or row.get("close") or 0,
+            row.get("close") or 0,
+        )
+        for row in recent
+        if row.get("close")
+    ]
+    return sum(ranges) / len(ranges) if ranges else 0
+
+
+def trade_plan(symbol, side, position_status, manual_entry=None, desired_rr=2.0):
+    rows = fetch_yahoo_chart(yahoo_symbol(symbol), "1y", "1d")
+    if len(rows) < 30:
+        return None
+
+    recent = rows[-24:]
+    candles = [row["close"] for row in recent if row.get("close")]
+    volume = [row["volume"] for row in recent if row.get("close")]
+    if len(candles) < 20:
+        return None
+
+    tech = technicals(candles, volume)
+    levels = key_levels(candles, tech)
+    volume_view = volume_analysis(candles, volume)
+    risk = risk_score(candles, neutral_sentiment())
+    overbought = overbought_indicator(tech, volume_view)
+    current = tech["lastPrice"]
+    entry = manual_entry if position_status == "Already entered" and manual_entry else current
+    atr = average_true_range(rows)
+    recent_range = max(0.01, levels["recentHigh"] - levels["recentLow"])
+    buffer = max(atr * 0.25, entry * 0.003)
+
+    if side == "Long / Buy":
+        stop = levels["nearestSupport"] - buffer
+        if stop >= entry:
+            stop = entry - max(atr, recent_range * 0.5, entry * 0.01)
+        key_target = levels["nearestResistance"]
+        if key_target <= entry:
+            key_target = entry + max(atr * 1.5, recent_range)
+        rr_target = entry + abs(entry - stop) * desired_rr
+        directional_note = "Long plan: protect below nearby support and look for upside into resistance or the selected risk/reward target."
+    else:
+        stop = levels["nearestResistance"] + buffer
+        if stop <= entry:
+            stop = entry + max(atr, recent_range * 0.5, entry * 0.01)
+        key_target = levels["nearestSupport"]
+        if key_target >= entry:
+            key_target = entry - max(atr * 1.5, recent_range)
+        rr_target = entry - abs(stop - entry) * desired_rr
+        directional_note = "Short plan: protect above nearby resistance and look for downside into support or the selected risk/reward target."
+
+    risk_amount = abs(entry - stop)
+    key_reward = abs(key_target - entry)
+    rr_reward = abs(rr_target - entry)
+    key_ratio = key_reward / risk_amount if risk_amount else 0
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "positionStatus": position_status,
+        "current": round(current, 2),
+        "entry": round(entry, 2),
+        "stop": round(stop, 2),
+        "keyTarget": round(key_target, 2),
+        "rrTarget": round(rr_target, 2),
+        "riskPct": round((risk_amount / entry) * 100, 2) if entry else 0,
+        "keyRewardPct": round((key_reward / entry) * 100, 2) if entry else 0,
+        "rrRewardPct": round((rr_reward / entry) * 100, 2) if entry else 0,
+        "keyRiskReward": round(key_ratio, 2),
+        "desiredRiskReward": desired_rr,
+        "levels": levels,
+        "tech": tech,
+        "risk": risk,
+        "volume": volume_view,
+        "overbought": overbought,
+        "atr": round(atr, 2),
+        "note": directional_note,
+    }
+
+
 def demo_market(symbol):
     market = DEMO_MARKET.get(symbol, DEMO_MARKET["NVDA"])
     return market["candles"], market["volume"], "demo"
@@ -1023,7 +1110,7 @@ def analyze(symbol):
 
 page = st.sidebar.radio(
     "Page",
-    ["Market Intelligence Terminal", "52-Week Drawdown Screener", "Consolidation Screener", "Suggested Trades"],
+    ["Market Intelligence Terminal", "52-Week Drawdown Screener", "Consolidation Screener", "Suggested Trades", "Trade Planner"],
 )
 
 if page == "52-Week Drawdown Screener":
@@ -1168,6 +1255,101 @@ if page == "Suggested Trades":
             )
         else:
             st.success("No trade candidates matched the selected score threshold.")
+
+    st.stop()
+
+
+if page == "Trade Planner":
+    st.title("Trade Planner")
+    st.caption("Plan stop-loss and take-profit levels for a new or existing long/short position using market structure.")
+    st.warning("Educational research only. These levels are planning references, not personalized financial advice.")
+
+    planner_symbol = st.text_input("Ticker", "NVDA", key="planner_symbol").upper().strip() or "NVDA"
+    side = st.radio("Trade direction", ["Long / Buy", "Short / Sell"], horizontal=True)
+    position_status = st.radio("Position status", ["Entering now", "Already entered"], horizontal=True)
+
+    manual_entry = None
+    if position_status == "Already entered":
+        manual_entry = st.number_input(
+            "Your entry price",
+            min_value=0.01,
+            value=100.0,
+            step=0.01,
+            help="Use the price where you already bought or sold short.",
+        )
+
+    desired_rr = st.slider(
+        "Desired risk/reward target",
+        min_value=1.0,
+        max_value=5.0,
+        value=2.0,
+        step=0.25,
+        help="Example: 2.0 means the take-profit target aims for about twice the stop-loss risk.",
+    )
+
+    if st.button("Build Trade Plan", type="primary"):
+        with st.spinner("Calculating stop-loss and take-profit levels..."):
+            plan = trade_plan(
+                planner_symbol,
+                side=side,
+                position_status=position_status,
+                manual_entry=manual_entry,
+                desired_rr=desired_rr,
+            )
+
+        if not plan:
+            st.error("Could not build a plan for this ticker right now. Try another symbol or rerun the planner.")
+        else:
+            st.subheader(f"{plan['symbol']} {plan['side']} Plan")
+            st.info(plan["note"])
+
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Current Price", f"${plan['current']}")
+            metric_cols[1].metric("Entry Used", f"${plan['entry']}")
+            metric_cols[2].metric("Stop Loss", f"${plan['stop']}", f"-{plan['riskPct']}% risk")
+            metric_cols[3].metric("RR Target", f"${plan['rrTarget']}", f"{plan['desiredRiskReward']}:1 target")
+
+            target_cols = st.columns(3)
+            target_cols[0].metric("Key-Level Take Profit", f"${plan['keyTarget']}", f"{plan['keyRewardPct']}% reward")
+            target_cols[1].metric("Key-Level R/R", f"{plan['keyRiskReward']}:1")
+            target_cols[2].metric("ATR Buffer", f"${plan['atr']}")
+
+            with st.expander("Why These Levels?", expanded=True):
+                st.write(
+                    f"The stop uses the nearest {'support' if side == 'Long / Buy' else 'resistance'} level with a volatility buffer. "
+                    f"The key-level take profit uses the nearest {'resistance' if side == 'Long / Buy' else 'support'} level. "
+                    f"The RR target uses your selected {desired_rr}:1 risk/reward setting."
+                )
+                st.write(
+                    f"Market structure: {plan['levels']['status']}. Support is ${plan['levels']['nearestSupport']} "
+                    f"and resistance is ${plan['levels']['nearestResistance']}."
+                )
+                st.write(
+                    f"Trend is {plan['tech']['bias']}, volume is {plan['volume']['label']}, "
+                    f"overbought risk is {plan['overbought']['level']}, and overall risk is {plan['risk']['level']}."
+                )
+
+            plan_df = pd.DataFrame([
+                {
+                    "Symbol": plan["symbol"],
+                    "Side": plan["side"],
+                    "Position Status": plan["positionStatus"],
+                    "Current": plan["current"],
+                    "Entry": plan["entry"],
+                    "Stop Loss": plan["stop"],
+                    "Risk %": plan["riskPct"],
+                    "Key-Level Take Profit": plan["keyTarget"],
+                    "Key-Level Reward %": plan["keyRewardPct"],
+                    "Key-Level R/R": plan["keyRiskReward"],
+                    "RR Take Profit": plan["rrTarget"],
+                    "RR Reward %": plan["rrRewardPct"],
+                    "Support": plan["levels"]["nearestSupport"],
+                    "Resistance": plan["levels"]["nearestResistance"],
+                    "Trend": plan["tech"]["bias"],
+                    "Risk": plan["risk"]["level"],
+                }
+            ])
+            st.dataframe(plan_df, use_container_width=True, hide_index=True)
 
     st.stop()
 
