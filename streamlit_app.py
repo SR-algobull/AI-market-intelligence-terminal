@@ -732,23 +732,38 @@ def trade_plan(symbol, side, position_status, manual_entry=None):
         directional_note = "Short plan: protect above nearby resistance and look for downside into the most relevant chart-based reaction area."
 
     target = chart_take_profit(side, entry, levels, atr)
-    risk_amount = abs(entry - stop)
-    reward = abs(target["price"] - entry)
+    displayed_entry = round(entry, 2)
+    displayed_stop = round(stop, 2)
+    displayed_target = round(target["price"], 2)
+    risk_amount = abs(displayed_entry - displayed_stop)
+    reward = abs(displayed_target - displayed_entry)
     ratio = reward / risk_amount if risk_amount else 0
+
+    if ratio >= 2:
+        ratio_label = f"{ratio:.2f}:1 favorable"
+    elif ratio >= 1:
+        ratio_label = f"{ratio:.2f}:1 balanced"
+    elif ratio > 0:
+        ratio_label = f"{ratio:.2f}:1 weak"
+    else:
+        ratio_label = "N/A"
 
     return {
         "symbol": symbol,
         "side": side,
         "positionStatus": position_status,
         "current": round(current, 2),
-        "entry": round(entry, 2),
-        "stop": round(stop, 2),
-        "takeProfit": round(target["price"], 2),
+        "entry": displayed_entry,
+        "stop": displayed_stop,
+        "takeProfit": displayed_target,
         "takeProfitBasis": target["basis"],
         "takeProfitExplanation": target["explanation"],
-        "riskPct": round((risk_amount / entry) * 100, 2) if entry else 0,
-        "rewardPct": round((reward / entry) * 100, 2) if entry else 0,
+        "riskPct": round((risk_amount / displayed_entry) * 100, 2) if displayed_entry else 0,
+        "rewardPct": round((reward / displayed_entry) * 100, 2) if displayed_entry else 0,
         "riskReward": round(ratio, 2),
+        "riskRewardLabel": ratio_label,
+        "riskAmount": round(risk_amount, 2),
+        "rewardAmount": round(reward, 2),
         "levels": levels,
         "tech": tech,
         "risk": risk,
@@ -1336,7 +1351,7 @@ if page == "Trade Planner":
 
             target_cols = st.columns(3)
             target_cols[0].metric("TP Basis", plan["takeProfitBasis"].title())
-            target_cols[1].metric("Chart-Based R/R", f"{plan['riskReward']}:1")
+            target_cols[1].metric("Chart-Based R/R", plan["riskRewardLabel"])
             target_cols[2].metric("ATR Buffer", f"${plan['atr']}")
 
             with st.expander("Why These Levels?", expanded=True):
@@ -1346,6 +1361,10 @@ if page == "Trade Planner":
                     "or retracement area instead of being created from the stop-loss distance."
                 )
                 st.write(plan["takeProfitExplanation"])
+                st.write(
+                    f"Risk/reward math: reward ${plan['rewardAmount']} divided by risk ${plan['riskAmount']} "
+                    f"= {plan['riskReward']}:1. This evaluates the chart-based TP; it does not create the TP."
+                )
                 st.write(
                     f"Market structure: {plan['levels']['status']}. Support is ${plan['levels']['nearestSupport']} "
                     f"and resistance is ${plan['levels']['nearestResistance']}."
@@ -1367,7 +1386,9 @@ if page == "Trade Planner":
                     "Take Profit": plan["takeProfit"],
                     "TP Basis": plan["takeProfitBasis"],
                     "Reward %": plan["rewardPct"],
-                    "Chart-Based R/R": plan["riskReward"],
+                    "Chart-Based R/R": plan["riskRewardLabel"],
+                    "Risk $": plan["riskAmount"],
+                    "Reward $": plan["rewardAmount"],
                     "Support": plan["levels"]["nearestSupport"],
                     "Resistance": plan["levels"]["nearestResistance"],
                     "Trend": plan["tech"]["bias"],
