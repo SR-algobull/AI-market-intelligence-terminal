@@ -716,28 +716,35 @@ def trade_plan(symbol, side, position_status, manual_entry=None):
     overbought = overbought_indicator(tech, volume_view)
     current = tech["lastPrice"]
     entry = manual_entry if position_status == "Already entered" and manual_entry else current
+    planning_price = current
     atr = average_true_range(rows)
     recent_range = max(0.01, levels["recentHigh"] - levels["recentLow"])
-    buffer = max(atr * 0.25, entry * 0.003)
+    buffer = max(atr * 0.25, planning_price * 0.003)
 
     if side == "Long / Buy":
         stop = levels["nearestSupport"] - buffer
-        if stop >= entry:
-            stop = entry - max(atr, recent_range * 0.5, entry * 0.01)
+        if stop >= planning_price:
+            stop = planning_price - max(atr, recent_range * 0.5, planning_price * 0.01)
         directional_note = "Long plan: protect below nearby support and look for upside into the most relevant chart-based reaction area."
     else:
         stop = levels["nearestResistance"] + buffer
-        if stop <= entry:
-            stop = entry + max(atr, recent_range * 0.5, entry * 0.01)
+        if stop <= planning_price:
+            stop = planning_price + max(atr, recent_range * 0.5, planning_price * 0.01)
         directional_note = "Short plan: protect above nearby resistance and look for downside into the most relevant chart-based reaction area."
 
-    target = chart_take_profit(side, entry, levels, atr)
+    target = chart_take_profit(side, planning_price, levels, atr)
+    displayed_current = round(current, 2)
     displayed_entry = round(entry, 2)
     displayed_stop = round(stop, 2)
     displayed_target = round(target["price"], 2)
-    risk_amount = abs(displayed_entry - displayed_stop)
-    reward = abs(displayed_target - displayed_entry)
+    risk_amount = abs(displayed_current - displayed_stop)
+    reward = abs(displayed_target - displayed_current)
     ratio = reward / risk_amount if risk_amount else 0
+    entry_pnl = (
+        ((displayed_current - displayed_entry) / displayed_entry) * 100
+        if side == "Long / Buy"
+        else ((displayed_entry - displayed_current) / displayed_entry) * 100
+    ) if displayed_entry else 0
 
     if ratio >= 2:
         ratio_label = f"{ratio:.2f}:1 favorable"
@@ -752,14 +759,15 @@ def trade_plan(symbol, side, position_status, manual_entry=None):
         "symbol": symbol,
         "side": side,
         "positionStatus": position_status,
-        "current": round(current, 2),
+        "current": displayed_current,
         "entry": displayed_entry,
         "stop": displayed_stop,
         "takeProfit": displayed_target,
         "takeProfitBasis": target["basis"],
         "takeProfitExplanation": target["explanation"],
-        "riskPct": round((risk_amount / displayed_entry) * 100, 2) if displayed_entry else 0,
-        "rewardPct": round((reward / displayed_entry) * 100, 2) if displayed_entry else 0,
+        "entryPnlPct": round(entry_pnl, 2),
+        "riskPct": round((risk_amount / displayed_current) * 100, 2) if displayed_current else 0,
+        "rewardPct": round((reward / displayed_current) * 100, 2) if displayed_current else 0,
         "riskReward": round(ratio, 2),
         "riskRewardLabel": ratio_label,
         "riskAmount": round(risk_amount, 2),
@@ -1345,9 +1353,9 @@ if page == "Trade Planner":
 
             metric_cols = st.columns(4)
             metric_cols[0].metric("Current Price", f"${plan['current']}")
-            metric_cols[1].metric("Entry Used", f"${plan['entry']}")
-            metric_cols[2].metric("Stop Loss", f"${plan['stop']}", f"-{plan['riskPct']}% risk")
-            metric_cols[3].metric("Take Profit", f"${plan['takeProfit']}", f"{plan['rewardPct']}% reward")
+            metric_cols[1].metric("Entry Price", f"${plan['entry']}", f"{plan['entryPnlPct']}% from entry")
+            metric_cols[2].metric("Stop Loss", f"${plan['stop']}", f"-{plan['riskPct']}% current risk")
+            metric_cols[3].metric("Take Profit", f"${plan['takeProfit']}", f"{plan['rewardPct']}% current reward")
 
             target_cols = st.columns(3)
             target_cols[0].metric("TP Basis", plan["takeProfitBasis"].title())
@@ -1362,8 +1370,8 @@ if page == "Trade Planner":
                 )
                 st.write(plan["takeProfitExplanation"])
                 st.write(
-                    f"Risk/reward math: reward ${plan['rewardAmount']} divided by risk ${plan['riskAmount']} "
-                    f"= {plan['riskReward']}:1. This evaluates the chart-based TP; it does not create the TP."
+                    f"Risk/reward math from current price: reward ${plan['rewardAmount']} divided by risk ${plan['riskAmount']} "
+                    f"= {plan['riskReward']}:1. For existing trades, this evaluates the hold/exit decision now; it does not use the old entry to create the TP."
                 )
                 st.write(
                     f"Market structure: {plan['levels']['status']}. Support is ${plan['levels']['nearestSupport']} "
@@ -1381,11 +1389,12 @@ if page == "Trade Planner":
                     "Position Status": plan["positionStatus"],
                     "Current": plan["current"],
                     "Entry": plan["entry"],
+                    "P/L From Entry %": plan["entryPnlPct"],
                     "Stop Loss": plan["stop"],
-                    "Risk %": plan["riskPct"],
+                    "Current Risk %": plan["riskPct"],
                     "Take Profit": plan["takeProfit"],
                     "TP Basis": plan["takeProfitBasis"],
-                    "Reward %": plan["rewardPct"],
+                    "Current Reward %": plan["rewardPct"],
                     "Chart-Based R/R": plan["riskRewardLabel"],
                     "Risk $": plan["riskAmount"],
                     "Reward $": plan["rewardAmount"],
