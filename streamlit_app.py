@@ -654,7 +654,51 @@ def average_true_range(rows, period=14):
     return sum(ranges) / len(ranges) if ranges else 0
 
 
-def trade_plan(symbol, side, position_status, manual_entry=None, desired_rr=2.0):
+def chart_take_profit(side, entry, levels, atr):
+    recent_range = max(0.01, levels["recentHigh"] - levels["recentLow"])
+    midpoint = (levels["recentHigh"] + levels["recentLow"]) / 2
+    min_move = max(atr * 0.35, entry * 0.004)
+
+    if side == "Long / Buy":
+        candidates = [
+            ("nearest resistance", levels["nearestResistance"], 4),
+            ("recent 20-day high", levels["recentHigh"], 3),
+            ("range midpoint retrace", midpoint, 2),
+            ("measured range extension", entry + recent_range * 0.75, 1),
+        ]
+        valid = [(name, price, weight) for name, price, weight in candidates if price > entry + min_move]
+    else:
+        candidates = [
+            ("nearest support", levels["nearestSupport"], 4),
+            ("recent 20-day low", levels["recentLow"], 3),
+            ("range midpoint retrace", midpoint, 2),
+            ("measured range extension", entry - recent_range * 0.75, 1),
+        ]
+        valid = [(name, price, weight) for name, price, weight in candidates if price < entry - min_move]
+
+    if not valid:
+        fallback = entry + recent_range if side == "Long / Buy" else entry - recent_range
+        return {
+            "price": fallback,
+            "basis": "measured recent range",
+            "explanation": "No nearby chart level was far enough from entry, so the planner used the recent trading range as a fallback target.",
+        }
+
+    def target_score(candidate):
+        _, price, weight = candidate
+        distance = abs(price - entry)
+        distance_score = 1 / max(distance / max(atr, entry * 0.01), 0.25)
+        return weight + distance_score
+
+    basis, price, _ = max(valid, key=target_score)
+    return {
+        "price": price,
+        "basis": basis,
+        "explanation": f"The take-profit is based on the {basis}, which is the nearest high-probability chart reaction area for this direction.",
+    }
+
+
+def trade_plan(symbol, side, position_status, manual_entry=None):
     rows = fetch_yahoo_chart(yahoo_symbol(symbol), "1y", "1d")
     if len(rows) < 30:
         return None
@@ -680,25 +724,17 @@ def trade_plan(symbol, side, position_status, manual_entry=None, desired_rr=2.0)
         stop = levels["nearestSupport"] - buffer
         if stop >= entry:
             stop = entry - max(atr, recent_range * 0.5, entry * 0.01)
-        key_target = levels["nearestResistance"]
-        if key_target <= entry:
-            key_target = entry + max(atr * 1.5, recent_range)
-        rr_target = entry + abs(entry - stop) * desired_rr
-        directional_note = "Long plan: protect below nearby support and look for upside into resistance or the selected risk/reward target."
+        directional_note = "Long plan: protect below nearby support and look for upside into the most relevant chart-based reaction area."
     else:
         stop = levels["nearestResistance"] + buffer
         if stop <= entry:
             stop = entry + max(atr, recent_range * 0.5, entry * 0.01)
-        key_target = levels["nearestSupport"]
-        if key_target >= entry:
-            key_target = entry - max(atr * 1.5, recent_range)
-        rr_target = entry - abs(stop - entry) * desired_rr
-        directional_note = "Short plan: protect above nearby resistance and look for downside into support or the selected risk/reward target."
+        directional_note = "Short plan: protect above nearby resistance and look for downside into the most relevant chart-based reaction area."
 
+    target = chart_take_profit(side, entry, levels, atr)
     risk_amount = abs(entry - stop)
-    key_reward = abs(key_target - entry)
-    rr_reward = abs(rr_target - entry)
-    key_ratio = key_reward / risk_amount if risk_amount else 0
+    reward = abs(target["price"] - entry)
+    ratio = reward / risk_amount if risk_amount else 0
 
     return {
         "symbol": symbol,
@@ -707,13 +743,12 @@ def trade_plan(symbol, side, position_status, manual_entry=None, desired_rr=2.0)
         "current": round(current, 2),
         "entry": round(entry, 2),
         "stop": round(stop, 2),
-        "keyTarget": round(key_target, 2),
-        "rrTarget": round(rr_target, 2),
+        "takeProfit": round(target["price"], 2),
+        "takeProfitBasis": target["basis"],
+        "takeProfitExplanation": target["explanation"],
         "riskPct": round((risk_amount / entry) * 100, 2) if entry else 0,
-        "keyRewardPct": round((key_reward / entry) * 100, 2) if entry else 0,
-        "rrRewardPct": round((rr_reward / entry) * 100, 2) if entry else 0,
-        "keyRiskReward": round(key_ratio, 2),
-        "desiredRiskReward": desired_rr,
+        "rewardPct": round((reward / entry) * 100, 2) if entry else 0,
+        "riskReward": round(ratio, 2),
         "levels": levels,
         "tech": tech,
         "risk": risk,
@@ -1278,15 +1313,6 @@ if page == "Trade Planner":
             help="Use the price where you already bought or sold short.",
         )
 
-    desired_rr = st.slider(
-        "Desired risk/reward target",
-        min_value=1.0,
-        max_value=5.0,
-        value=2.0,
-        step=0.25,
-        help="Example: 2.0 means the take-profit target aims for about twice the stop-loss risk.",
-    )
-
     if st.button("Build Trade Plan", type="primary"):
         with st.spinner("Calculating stop-loss and take-profit levels..."):
             plan = trade_plan(
@@ -1294,7 +1320,6 @@ if page == "Trade Planner":
                 side=side,
                 position_status=position_status,
                 manual_entry=manual_entry,
-                desired_rr=desired_rr,
             )
 
         if not plan:
@@ -1307,19 +1332,20 @@ if page == "Trade Planner":
             metric_cols[0].metric("Current Price", f"${plan['current']}")
             metric_cols[1].metric("Entry Used", f"${plan['entry']}")
             metric_cols[2].metric("Stop Loss", f"${plan['stop']}", f"-{plan['riskPct']}% risk")
-            metric_cols[3].metric("RR Target", f"${plan['rrTarget']}", f"{plan['desiredRiskReward']}:1 target")
+            metric_cols[3].metric("Take Profit", f"${plan['takeProfit']}", f"{plan['rewardPct']}% reward")
 
             target_cols = st.columns(3)
-            target_cols[0].metric("Key-Level Take Profit", f"${plan['keyTarget']}", f"{plan['keyRewardPct']}% reward")
-            target_cols[1].metric("Key-Level R/R", f"{plan['keyRiskReward']}:1")
+            target_cols[0].metric("TP Basis", plan["takeProfitBasis"].title())
+            target_cols[1].metric("Chart-Based R/R", f"{plan['riskReward']}:1")
             target_cols[2].metric("ATR Buffer", f"${plan['atr']}")
 
             with st.expander("Why These Levels?", expanded=True):
                 st.write(
                     f"The stop uses the nearest {'support' if side == 'Long / Buy' else 'resistance'} level with a volatility buffer. "
-                    f"The key-level take profit uses the nearest {'resistance' if side == 'Long / Buy' else 'support'} level. "
-                    f"The RR target uses your selected {desired_rr}:1 risk/reward setting."
+                    "The take-profit is chart-driven, meaning it is selected from the most relevant support/resistance, range, "
+                    "or retracement area instead of being created from the stop-loss distance."
                 )
+                st.write(plan["takeProfitExplanation"])
                 st.write(
                     f"Market structure: {plan['levels']['status']}. Support is ${plan['levels']['nearestSupport']} "
                     f"and resistance is ${plan['levels']['nearestResistance']}."
@@ -1338,11 +1364,10 @@ if page == "Trade Planner":
                     "Entry": plan["entry"],
                     "Stop Loss": plan["stop"],
                     "Risk %": plan["riskPct"],
-                    "Key-Level Take Profit": plan["keyTarget"],
-                    "Key-Level Reward %": plan["keyRewardPct"],
-                    "Key-Level R/R": plan["keyRiskReward"],
-                    "RR Take Profit": plan["rrTarget"],
-                    "RR Reward %": plan["rrRewardPct"],
+                    "Take Profit": plan["takeProfit"],
+                    "TP Basis": plan["takeProfitBasis"],
+                    "Reward %": plan["rewardPct"],
+                    "Chart-Based R/R": plan["riskReward"],
                     "Support": plan["levels"]["nearestSupport"],
                     "Resistance": plan["levels"]["nearestResistance"],
                     "Trend": plan["tech"]["bias"],
