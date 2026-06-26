@@ -782,6 +782,178 @@ def trade_plan(symbol, side, position_status, manual_entry=None):
     }
 
 
+def tradier_headers():
+    token = secret("TRADIER_API_TOKEN")
+    if not token:
+        return None
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def tradier_get(path, params=None):
+    headers = tradier_headers()
+    if not headers:
+        raise RuntimeError("Missing Tradier API token")
+    base_url = secret("TRADIER_BASE_URL", "https://api.tradier.com/v1").rstrip("/")
+    response = requests.get(f"{base_url}{path}", headers=headers, params=params or {}, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_tradier_quote(symbol):
+    data = tradier_get("/markets/quotes", {"symbols": symbol})
+    quote = data.get("quotes", {}).get("quote")
+    if isinstance(quote, list):
+        quote = quote[0] if quote else {}
+    return quote or {}
+
+
+def fetch_tradier_expirations(symbol):
+    data = tradier_get("/markets/options/expirations", {"symbol": symbol, "includeAllRoots": "true"})
+    dates = data.get("expirations", {}).get("date", [])
+    if isinstance(dates, str):
+        dates = [dates]
+    return dates
+
+
+def fetch_tradier_chain(symbol, expiration):
+    data = tradier_get(
+        "/markets/options/chains",
+        {"symbol": symbol, "expiration": expiration, "greeks": "true"},
+    )
+    options = data.get("options", {}).get("option", [])
+    if isinstance(options, dict):
+        options = [options]
+    return options or []
+
+
+def option_mid(option):
+    bid = float(option.get("bid") or 0)
+    ask = float(option.get("ask") or 0)
+    last = float(option.get("last") or 0)
+    if bid > 0 and ask > 0:
+        return round((bid + ask) / 2, 2)
+    return round(last, 2) if last > 0 else 0
+
+
+def option_delta(option):
+    greeks = option.get("greeks") or {}
+    try:
+        return round(float(greeks.get("delta", 0)), 3)
+    except (TypeError, ValueError):
+        return 0
+
+
+def liquid_options(options, option_type):
+    filtered = []
+    for option in options:
+        if option.get("option_type") != option_type:
+            continue
+        mid = option_mid(option)
+        if mid <= 0:
+            continue
+        filtered.append({**option, "mid": mid, "deltaValue": option_delta(option)})
+    return sorted(filtered, key=lambda row: float(row.get("strike") or 0))
+
+
+def nearest_by_strike(options, target, below=None):
+    candidates = []
+    for option in options:
+        strike = float(option.get("strike") or 0)
+        if below is True and strike > target:
+            continue
+        if below is False and strike < target:
+            continue
+        candidates.append(option)
+    if not candidates:
+        candidates = options
+    return min(candidates, key=lambda row: abs(float(row.get("strike") or 0) - target)) if candidates else None
+
+
+def spread_short_leg(options, long_leg, boundary_price, bias):
+    if not long_leg:
+        return None
+    long_strike = float(long_leg.get("strike") or 0)
+    if bias == "Bullish":
+        candidates = [option for option in options if float(option.get("strike") or 0) > long_strike]
+    else:
+        candidates = [option for option in options if float(option.get("strike") or 0) < long_strike]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda row: abs(float(row.get("strike") or 0) - boundary_price))
+
+
+def option_contract_summary(option):
+    if not option:
+        return {}
+    return {
+        "Symbol": option.get("symbol"),
+        "Strike": float(option.get("strike") or 0),
+        "Type": option.get("option_type", "").upper(),
+        "Bid": float(option.get("bid") or 0),
+        "Ask": float(option.get("ask") or 0),
+        "Mid": option.get("mid", option_mid(option)),
+        "Delta": option.get("deltaValue", option_delta(option)),
+        "Volume": int(option.get("volume") or 0),
+        "Open Interest": int(option.get("open_interest") or 0),
+    }
+
+
+def build_options_idea(symbol, bias, boundary_price, expiration):
+    quote = fetch_tradier_quote(symbol)
+    current = float(quote.get("last") or quote.get("close") or quote.get("bid") or quote.get("ask") or 0)
+    chain = fetch_tradier_chain(symbol, expiration)
+    if not current or not chain:
+        return None
+
+    if bias == "Bullish":
+        calls = liquid_options(chain, "call")
+        long_leg = nearest_by_strike(calls, current, below=True)
+        short_leg = spread_short_leg(calls, long_leg, boundary_price, bias)
+        strategy = "Bull Call Debit Spread"
+        thesis = "Bullish but capped: buy a call near the current price and sell a call near the price you do not expect it to exceed."
+    else:
+        puts = liquid_options(chain, "put")
+        long_leg = nearest_by_strike(puts, current, below=False)
+        short_leg = spread_short_leg(puts, long_leg, boundary_price, bias)
+        strategy = "Bear Put Debit Spread"
+        thesis = "Bearish but bounded: buy a put near the current price and sell a put near the price you do not expect it to fall below."
+
+    if not long_leg or not short_leg:
+        return None
+
+    long_strike = float(long_leg.get("strike") or 0)
+    short_strike = float(short_leg.get("strike") or 0)
+    width = abs(short_strike - long_strike)
+    debit = max(0, round(float(long_leg["mid"]) - float(short_leg["mid"]), 2))
+    max_profit = max(0, round(width - debit, 2))
+    breakeven = round(long_strike + debit, 2) if bias == "Bullish" else round(long_strike - debit, 2)
+    rr = round(max_profit / debit, 2) if debit else 0
+
+    single_option = long_leg
+    return {
+        "symbol": symbol,
+        "bias": bias,
+        "current": round(current, 2),
+        "expiration": expiration,
+        "boundary": boundary_price,
+        "strategy": strategy,
+        "thesis": thesis,
+        "longLeg": option_contract_summary(long_leg),
+        "shortLeg": option_contract_summary(short_leg),
+        "singleOption": option_contract_summary(single_option),
+        "debit": debit,
+        "width": round(width, 2),
+        "maxProfit": max_profit,
+        "breakeven": breakeven,
+        "riskReward": f"{rr}:1" if rr else "N/A",
+        "explanation": (
+            f"The spread uses the long leg near current price ${round(current, 2)} and the short leg near your "
+            f"{'upside ceiling' if bias == 'Bullish' else 'downside floor'} of ${boundary_price}. "
+            "This keeps the idea aligned with your view instead of choosing a random strike."
+        ),
+    }
+
+
 def demo_market(symbol):
     market = DEMO_MARKET.get(symbol, DEMO_MARKET["NVDA"])
     return market["candles"], market["volume"], "demo"
@@ -1168,7 +1340,14 @@ def analyze(symbol):
 
 page = st.sidebar.radio(
     "Page",
-    ["Market Intelligence Terminal", "52-Week Drawdown Screener", "Consolidation Screener", "Suggested Trades", "Trade Planner"],
+    [
+        "Market Intelligence Terminal",
+        "52-Week Drawdown Screener",
+        "Consolidation Screener",
+        "Suggested Trades",
+        "Trade Planner",
+        "Options Strategy Builder",
+    ],
 )
 
 if page == "52-Week Drawdown Screener":
@@ -1405,6 +1584,104 @@ if page == "Trade Planner":
                 }
             ])
             st.dataframe(plan_df, use_container_width=True, hide_index=True)
+
+    st.stop()
+
+
+if page == "Options Strategy Builder":
+    st.title("Options Strategy Builder")
+    st.caption("Use Tradier option-chain data to match a bullish or bearish view with a single option or defined-risk vertical spread.")
+    st.warning("Educational research only. This does not place trades and is not personalized financial advice.")
+
+    if not secret("TRADIER_API_TOKEN"):
+        st.error("Missing Tradier setup. Add TRADIER_API_TOKEN to Streamlit secrets or your local .env file.")
+        st.stop()
+
+    option_symbol = st.text_input("Ticker", "NVDA", key="options_symbol").upper().strip() or "NVDA"
+    bias = st.radio("Directional view", ["Bullish", "Bearish"], horizontal=True)
+
+    try:
+        quote = fetch_tradier_quote(option_symbol)
+        current_price = float(quote.get("last") or quote.get("close") or quote.get("bid") or quote.get("ask") or 0)
+        expirations = fetch_tradier_expirations(option_symbol)
+    except Exception as error:
+        st.error(f"Tradier data could not be loaded: {str(error)[:160]}")
+        st.stop()
+
+    if not current_price:
+        st.error("Tradier did not return a usable stock price for this ticker.")
+        st.stop()
+    if not expirations:
+        st.error("Tradier did not return option expirations for this ticker.")
+        st.stop()
+
+    default_boundary = current_price * 1.05 if bias == "Bullish" else current_price * 0.95
+    boundary_label = (
+        "Price level you think it will not go over"
+        if bias == "Bullish"
+        else "Price level you think it will not go below"
+    )
+
+    st.metric("Current Stock Price", f"${round(current_price, 2)}")
+    expiration = st.selectbox("Expiration", expirations[:12], index=min(2, len(expirations[:12]) - 1))
+    boundary = st.number_input(
+        boundary_label,
+        min_value=0.01,
+        value=round(default_boundary, 2),
+        step=0.5,
+        help="This level is used to choose the short strike in the spread.",
+    )
+
+    if bias == "Bullish" and boundary <= current_price:
+        st.warning("For a bullish capped spread, choose a level above the current stock price.")
+    if bias == "Bearish" and boundary >= current_price:
+        st.warning("For a bearish bounded spread, choose a level below the current stock price.")
+
+    if st.button("Find Option Idea", type="primary"):
+        if (bias == "Bullish" and boundary <= current_price) or (bias == "Bearish" and boundary >= current_price):
+            st.error("Adjust the boundary level first so it matches your directional view.")
+            st.stop()
+        with st.spinner("Pulling Tradier option chain and building strategy..."):
+            try:
+                idea = build_options_idea(option_symbol, bias, boundary, expiration)
+            except Exception as error:
+                st.error(f"Could not build an option idea from Tradier data: {str(error)[:180]}")
+                st.stop()
+
+        if not idea:
+            st.error("Could not find a liquid enough option setup for that ticker, expiration, and level.")
+        else:
+            st.subheader(f"{idea['symbol']} {idea['strategy']}")
+            st.info(idea["thesis"])
+
+            summary_cols = st.columns(5)
+            summary_cols[0].metric("Stock", f"${idea['current']}")
+            summary_cols[1].metric("Boundary", f"${idea['boundary']}")
+            summary_cols[2].metric("Net Debit", f"${idea['debit']}")
+            summary_cols[3].metric("Max Profit", f"${idea['maxProfit']}")
+            summary_cols[4].metric("Spread R/R", idea["riskReward"])
+
+            st.metric("Breakeven", f"${idea['breakeven']}")
+
+            legs = pd.DataFrame([
+                {"Leg": "Buy", **idea["longLeg"]},
+                {"Leg": "Sell", **idea["shortLeg"]},
+            ])
+            st.dataframe(legs, use_container_width=True, hide_index=True)
+
+            with st.expander("Why This Strategy?", expanded=True):
+                st.write(idea["explanation"])
+                st.write(
+                    "The spread is defined risk: the debit is the estimated max loss before commissions/fees, "
+                    "and the max profit is the strike width minus that debit."
+                )
+                st.write(
+                    "The single-option alternative is shown below, but the spread is usually more aligned with a capped view "
+                    "because selling the boundary strike helps finance the long option."
+                )
+
+            st.subheader("Single Option Alternative")
+            st.dataframe(pd.DataFrame([idea["singleOption"]]), use_container_width=True, hide_index=True)
 
     st.stop()
 

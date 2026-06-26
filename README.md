@@ -9,6 +9,7 @@ A portfolio-grade AI finance platform that combines market technicals, NLP senti
 - Score bullish/bearish sentiment with confidence and token-level evidence.
 - Calculate RSI, VWAP, MACD, trend strength, volatility, and unusual activity.
 - Combine technicals, NLP, options flow, sector rotation, and risk into a trade confidence score.
+- Build educational options ideas with Tradier option-chain data.
 - Explain why the model is bullish, bearish, or mixed.
 
 ## Architecture
@@ -53,6 +54,13 @@ StockTwits social data is pulled from the ticker message stream and merged into 
 For Streamlit Cloud, do not commit real credentials to GitHub. Add deployment credentials only in **Manage app -> Settings -> Secrets**, then reboot the app.
 
 The repository includes safe placeholder templates only. The real `.env` and `.streamlit/secrets.toml` files are ignored by Git.
+
+For the options strategy page, add:
+
+```toml
+TRADIER_API_TOKEN = "your_tradier_token_here"
+TRADIER_BASE_URL = "https://api.tradier.com/v1"
+```
 
 ## Test
 
