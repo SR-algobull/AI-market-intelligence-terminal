@@ -1,6 +1,10 @@
 import base64
+from email.message import EmailMessage
+import json
 import math
 import os
+import smtplib
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import altair as alt
@@ -954,6 +958,274 @@ def build_options_idea(symbol, bias, boundary_price, expiration):
     }
 
 
+AI_TRADES_DB = "ai_trades.sqlite3"
+
+
+def ai_trade_db():
+    connection = sqlite3.connect(AI_TRADES_DB)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry REAL NOT NULL,
+            stop_loss REAL NOT NULL,
+            target_1 REAL NOT NULL,
+            target_2 REAL NOT NULL,
+            score REAL NOT NULL,
+            risk_reward REAL NOT NULL,
+            status TEXT NOT NULL,
+            last_price REAL,
+            rationale TEXT NOT NULL,
+            instructions TEXT NOT NULL,
+            data_json TEXT NOT NULL,
+            alert_email TEXT,
+            alerted_at TEXT,
+            closed_at TEXT
+        )
+        """
+    )
+    connection.commit()
+    return connection
+
+
+def current_stock_price(symbol):
+    candles, _, _ = fetch_yahoo_market_snapshot(yahoo_symbol(symbol))
+    if candles:
+        return round(candles[-1], 2)
+    rows = fetch_yahoo_chart(yahoo_symbol(symbol), "5d", "1d")
+    closes = [row["close"] for row in rows if row.get("close")]
+    return round(closes[-1], 2) if closes else None
+
+
+def parse_ratio(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).split(":")[0].split()[0])
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def ai_trade_instructions(symbol, side, entry, stop, target_1, target_2, metrics, plan):
+    direction = "long" if side == "Bullish" else "short"
+    trigger = (
+        f"Look for price to hold above ${entry} with improving volume before considering the {direction} idea."
+        if side == "Bullish"
+        else f"Look for price to stay below ${entry} with weak bounces before considering the {direction} idea."
+    )
+    return (
+        f"{symbol} {side.lower()} watch. Trigger: {trigger} "
+        f"Stop/invalidation: ${stop}. Target 1: ${target_1}. Target 2: ${target_2}. "
+        f"Manage risk first: if price hits the stop, the setup is considered failed; if price reaches Target 1, "
+        "consider whether to reduce risk or trail based on volume and trend confirmation. "
+        f"Core reason: {metrics['Rationale']} Trade planner context: {plan['takeProfitExplanation']}"
+    )
+
+
+def openai_ai_trade_rationale(trade):
+    api_key = secret("OPENAI_API_KEY")
+    if not api_key:
+        return trade["instructions"]
+    model = secret("OPENAI_MODEL", "gpt-5.2")
+    payload = {
+        "model": model,
+        "instructions": "You are an institutional equity trade research assistant. Be concise. Do not give personalized financial advice.",
+        "input": (
+            f"Create a concise educational trade-plan explanation for this AI-generated stock setup.\n"
+            f"Symbol: {trade['symbol']}\nSide: {trade['side']}\nEntry area: {trade['entry']}\n"
+            f"Stop: {trade['stop_loss']}\nTarget 1: {trade['target_1']}\nTarget 2: {trade['target_2']}\n"
+            f"Score: {trade['score']}\nRisk/reward: {trade['risk_reward']}:1\n"
+            f"Rationale: {trade['rationale']}\nInstructions: {trade['instructions']}\n"
+            "Return five compact lines: setup, trigger, stop/invalidation, targets, why it is attractive."
+        ),
+    }
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"authorization": f"Bearer {api_key}", "content-type": "application/json"},
+        json=payload,
+        timeout=45,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data.get("output_text") or trade["instructions"]
+
+
+def build_ai_trade(symbol, include_nlp=False):
+    metrics = suggested_trade_metrics(symbol, include_nlp=include_nlp)
+    if not metrics or metrics["Side"] not in {"Bullish", "Bearish"}:
+        return None
+
+    planner_side = "Long / Buy" if metrics["Side"] == "Bullish" else "Short / Sell"
+    plan = trade_plan(symbol, planner_side, "Entering now")
+    if not plan:
+        return None
+
+    entry = plan["current"]
+    stop = plan["stop"]
+    target_1 = plan["takeProfit"]
+    reward = abs(target_1 - entry)
+    target_2 = round(entry + reward * 1.5, 2) if metrics["Side"] == "Bullish" else max(0.01, round(entry - reward * 1.5, 2))
+    rr = parse_ratio(plan["riskReward"])
+
+    trade = {
+        "symbol": symbol,
+        "side": metrics["Side"],
+        "entry": entry,
+        "stop_loss": stop,
+        "target_1": target_1,
+        "target_2": target_2,
+        "score": metrics["Score"],
+        "risk_reward": rr,
+        "status": "OPEN",
+        "last_price": entry,
+        "rationale": metrics["Rationale"],
+        "instructions": ai_trade_instructions(symbol, metrics["Side"], entry, stop, target_1, target_2, metrics, plan),
+        "data": {"metrics": metrics, "plan": plan},
+    }
+    try:
+        trade["ai_explanation"] = openai_ai_trade_rationale(trade)
+    except Exception:
+        trade["ai_explanation"] = trade["instructions"]
+    return trade
+
+
+def scan_ai_trades(symbols, max_symbols=50, include_nlp=False, min_score=58, min_rr=1.0):
+    selected_symbols = symbols[:max_symbols]
+    results = []
+    progress = st.progress(0, text="Scanning AI trade setups...")
+    for index, symbol in enumerate(selected_symbols):
+        trade = build_ai_trade(symbol, include_nlp=include_nlp)
+        if trade and trade["score"] >= min_score and trade["risk_reward"] >= min_rr:
+            results.append(trade)
+        progress.progress((index + 1) / max(1, len(selected_symbols)), text=f"Scanned {index + 1}/{len(selected_symbols)}")
+    progress.empty()
+    return sorted(results, key=lambda row: (row["score"], row["risk_reward"]), reverse=True)
+
+
+def save_ai_trade(trade, alert_email=None):
+    connection = ai_trade_db()
+    cursor = connection.execute(
+        """
+        INSERT INTO ai_trades (
+            created_at, symbol, side, entry, stop_loss, target_1, target_2, score, risk_reward,
+            status, last_price, rationale, instructions, data_json, alert_email
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now(timezone.utc).isoformat(),
+            trade["symbol"],
+            trade["side"],
+            trade["entry"],
+            trade["stop_loss"],
+            trade["target_1"],
+            trade["target_2"],
+            trade["score"],
+            trade["risk_reward"],
+            trade["status"],
+            trade["last_price"],
+            trade["rationale"],
+            trade.get("ai_explanation", trade["instructions"]),
+            json.dumps(trade["data"]),
+            alert_email,
+        ),
+    )
+    connection.commit()
+    connection.close()
+    return cursor.lastrowid
+
+
+def load_ai_trades():
+    connection = ai_trade_db()
+    rows = pd.read_sql_query("SELECT * FROM ai_trades ORDER BY created_at DESC", connection)
+    connection.close()
+    return rows
+
+
+def ai_trade_status(row, last_price):
+    side = row["side"]
+    if side == "Bullish":
+        if last_price <= row["stop_loss"]:
+            return "LOST"
+        if last_price >= row["target_2"]:
+            return "WON_T2"
+        if last_price >= row["target_1"]:
+            return "WON_T1"
+    else:
+        if last_price >= row["stop_loss"]:
+            return "LOST"
+        if last_price <= row["target_2"]:
+            return "WON_T2"
+        if last_price <= row["target_1"]:
+            return "WON_T1"
+    return "OPEN"
+
+
+def smtp_ready():
+    return all(secret(name) for name in ["SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD", "EMAIL_FROM"])
+
+
+def send_trade_alert(to_email, row, last_price, new_status):
+    if not to_email or not smtp_ready():
+        return False
+    message = EmailMessage()
+    message["Subject"] = f"AI Trade Alert: {row['symbol']} {new_status}"
+    message["From"] = secret("EMAIL_FROM")
+    message["To"] = to_email
+    message.set_content(
+        f"{row['symbol']} {row['side']} trade level triggered.\n\n"
+        f"Status: {new_status}\nLast price: ${last_price}\nEntry: ${row['entry']}\n"
+        f"Stop: ${row['stop_loss']}\nTarget 1: ${row['target_1']}\nTarget 2: ${row['target_2']}\n\n"
+        f"Original plan:\n{row['instructions']}"
+    )
+    port = int(secret("SMTP_PORT", "587"))
+    with smtplib.SMTP(secret("SMTP_HOST"), port, timeout=20) as server:
+        server.starttls()
+        server.login(secret("SMTP_USERNAME"), secret("SMTP_PASSWORD"))
+        server.send_message(message)
+    return True
+
+
+def monitor_ai_trades():
+    rows = load_ai_trades()
+    if rows.empty:
+        return rows
+    connection = ai_trade_db()
+    updated = []
+    for _, row in rows.iterrows():
+        if row["status"] not in {"OPEN", "WON_T1"}:
+            updated.append(row.to_dict())
+            continue
+        last_price = current_stock_price(row["symbol"])
+        if not last_price:
+            updated.append(row.to_dict())
+            continue
+        new_status = ai_trade_status(row, last_price)
+        alerted_at = row.get("alerted_at")
+        closed_at = row.get("closed_at")
+        if new_status != row["status"]:
+            closed_at = datetime.now(timezone.utc).isoformat() if new_status in {"LOST", "WON_T2"} else closed_at
+            if not alerted_at and row.get("alert_email"):
+                try:
+                    if send_trade_alert(row["alert_email"], row, last_price, new_status):
+                        alerted_at = datetime.now(timezone.utc).isoformat()
+                except Exception:
+                    alerted_at = alerted_at
+        connection.execute(
+            "UPDATE ai_trades SET status = ?, last_price = ?, alerted_at = ?, closed_at = ? WHERE id = ?",
+            (new_status, last_price, alerted_at, closed_at, int(row["id"])),
+        )
+        updated_row = row.to_dict()
+        updated_row.update({"status": new_status, "last_price": last_price, "alerted_at": alerted_at, "closed_at": closed_at})
+        updated.append(updated_row)
+    connection.commit()
+    connection.close()
+    return pd.DataFrame(updated)
+
+
 def demo_market(symbol):
     market = DEMO_MARKET.get(symbol, DEMO_MARKET["NVDA"])
     return market["candles"], market["volume"], "demo"
@@ -1345,6 +1617,7 @@ page = st.sidebar.radio(
         "52-Week Drawdown Screener",
         "Consolidation Screener",
         "Suggested Trades",
+        "AI Trades",
         "Trade Planner",
         "Options Strategy Builder",
     ],
@@ -1492,6 +1765,142 @@ if page == "Suggested Trades":
             )
         else:
             st.success("No trade candidates matched the selected score threshold.")
+
+    st.stop()
+
+
+if page == "AI Trades":
+    st.title("AI Trades")
+    st.caption("Generate concise AI trade setups, save them to a tracker, and monitor whether targets or stops are hit.")
+    st.warning("Educational research only. These are AI-generated watchlist plans, not personalized financial advice or executable orders.")
+
+    universe = st.selectbox("Universe", ["S&P 500", "Nasdaq-100", "S&P 500 + Nasdaq-100"], key="ai_trades_universe")
+    max_symbols = st.number_input(
+        "Max symbols to scan",
+        min_value=10,
+        max_value=300,
+        value=50,
+        step=10,
+        key="ai_trades_max_symbols",
+        help="Higher values scan more names but take longer.",
+    )
+    min_score = st.slider("Minimum AI trade score", 40, 95, 62, 1, key="ai_trades_min_score")
+    min_rr = st.slider("Minimum chart-based R/R", 0.5, 5.0, 1.2, 0.1, key="ai_trades_min_rr")
+    include_nlp = st.checkbox("Include live NLP sentiment", value=False, key="ai_trades_nlp", help="Slower because it pulls news/social text per symbol.")
+    alert_email = st.text_input("Email for level alerts", "", key="ai_trades_email", help="Optional. Requires SMTP secrets to be configured.")
+
+    if universe == "S&P 500":
+        symbols = fetch_sp500_symbols()
+    elif universe == "Nasdaq-100":
+        symbols = fetch_nasdaq100_symbols()
+    else:
+        symbols = sorted(set(fetch_sp500_symbols() + fetch_nasdaq100_symbols()))
+
+    st.write(f"Universe size: {len(symbols)} symbols")
+    st.info(
+        "AI Trades ranks setups by the existing technical, volume, key-level, risk, 52-week, sentiment, and chart-based R/R signals. "
+        "The AI explanation turns those signals into a concise playbook."
+    )
+
+    if alert_email and not smtp_ready():
+        st.warning("Email is entered, but SMTP secrets are not configured yet. The trade can still be tracked, but alerts will not send.")
+
+    if st.button("Find AI Trades", type="primary"):
+        with st.spinner("Scanning for AI trade setups..."):
+            ideas = scan_ai_trades(
+                symbols,
+                max_symbols=int(max_symbols),
+                include_nlp=include_nlp,
+                min_score=min_score,
+                min_rr=min_rr,
+            )
+        st.session_state.ai_trade_ideas = ideas[:10]
+
+    ideas = st.session_state.get("ai_trade_ideas", [])
+    if ideas:
+        st.subheader("Top AI Trade Ideas")
+        for index, idea in enumerate(ideas, start=1):
+            with st.expander(f"{index}. {idea['symbol']} {idea['side']} | Score {idea['score']} | R/R {idea['risk_reward']}:1", expanded=index == 1):
+                cols = st.columns(5)
+                cols[0].metric("Entry Area", f"${idea['entry']}")
+                cols[1].metric("Stop", f"${idea['stop_loss']}")
+                cols[2].metric("Target 1", f"${idea['target_1']}")
+                cols[3].metric("Target 2", f"${idea['target_2']}")
+                cols[4].metric("Score", idea["score"])
+                st.write(idea.get("ai_explanation", idea["instructions"]))
+                st.caption("Saved trades are monitored against Target 1, Target 2, and Stop. Target/stop checks use the latest available Yahoo quote snapshot.")
+                if st.button(f"Save {idea['symbol']} To AI Trade Tracker", key=f"save_ai_trade_{index}"):
+                    trade_id = save_ai_trade(idea, alert_email=alert_email.strip() or None)
+                    st.success(f"Saved {idea['symbol']} as AI trade #{trade_id}.")
+
+        ideas_df = pd.DataFrame([
+            {
+                "Symbol": idea["symbol"],
+                "Side": idea["side"],
+                "Entry": idea["entry"],
+                "Stop": idea["stop_loss"],
+                "Target 1": idea["target_1"],
+                "Target 2": idea["target_2"],
+                "Score": idea["score"],
+                "R/R": idea["risk_reward"],
+                "Rationale": idea["rationale"],
+            }
+            for idea in ideas
+        ])
+        st.download_button(
+            "Download AI Ideas CSV",
+            ideas_df.to_csv(index=False),
+            file_name="ai_trade_ideas.csv",
+            mime="text/csv",
+        )
+
+    st.subheader("AI Trade Tracker")
+    tracker_cols = st.columns(2)
+    monitor_clicked = tracker_cols[0].button("Refresh Monitor")
+    clear_closed = tracker_cols[1].checkbox("Show closed trades", value=True)
+    st.caption("Saved trades are checked whenever this page loads or refreshes. Email alerts send once when a saved trade hits Target 1, Target 2, or Stop, if SMTP secrets are configured.")
+
+    tracked = monitor_ai_trades()
+    if monitor_clicked:
+        st.success("Saved AI trades refreshed.")
+    if tracked.empty:
+        st.info("No AI trades saved yet.")
+    else:
+        display = tracked.copy()
+        if not clear_closed:
+            display = display[display["status"].isin(["OPEN", "WON_T1"])]
+        if display.empty:
+            st.info("No trades match the current tracker filter.")
+        else:
+            st.dataframe(
+                display[
+                    [
+                        "id",
+                        "created_at",
+                        "symbol",
+                        "side",
+                        "status",
+                        "entry",
+                        "last_price",
+                        "stop_loss",
+                        "target_1",
+                        "target_2",
+                        "score",
+                        "risk_reward",
+                        "alert_email",
+                        "alerted_at",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            with st.expander("Saved Trade Details", expanded=False):
+                selected_id = st.number_input("Trade ID", min_value=1, value=int(display["id"].iloc[0]), step=1)
+                selected = tracked[tracked["id"] == selected_id]
+                if not selected.empty:
+                    row = selected.iloc[0]
+                    st.write(row["instructions"])
+                    st.json(json.loads(row["data_json"]))
 
     st.stop()
 

@@ -4,4 +4,5 @@ node_modules/
 dist/
 .vite/
 __pycache__/
+ai_trades.sqlite3
 npm-debug.log*

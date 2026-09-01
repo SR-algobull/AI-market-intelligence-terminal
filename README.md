@@ -9,6 +9,7 @@ A portfolio-grade AI finance platform that combines market technicals, NLP senti
 - Score bullish/bearish sentiment with confidence and token-level evidence.
 - Calculate RSI, VWAP, MACD, trend strength, volatility, and unusual activity.
 - Combine technicals, NLP, options flow, sector rotation, and risk into a trade confidence score.
+- Generate concise AI trade plans, track saved setups, and mark them as won/lost when levels are hit.
 - Build educational options ideas with Tradier option-chain data.
 - Explain why the model is bullish, bearish, or mixed.
 
@@ -61,6 +62,18 @@ For the options strategy page, add:
 TRADIER_API_TOKEN = "your_tradier_token_here"
 TRADIER_BASE_URL = "https://api.tradier.com/v1"
 ```
+
+For AI trade email alerts, optionally add SMTP settings:
+
+```toml
+SMTP_HOST = "smtp.example.com"
+SMTP_PORT = "587"
+SMTP_USERNAME = "your_smtp_username"
+SMTP_PASSWORD = "your_smtp_password"
+EMAIL_FROM = "alerts@example.com"
+```
+
+The AI Trades page creates a runtime SQLite database named `ai_trades.sqlite3`; it is ignored by Git so saved trade history is not committed.
 
 ## Test
 
